@@ -20,6 +20,7 @@ import os
 import random
 import threading
 import time
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from typing import Any, Optional
 
@@ -371,6 +372,74 @@ def _emit_cancelled_terminal_post_tool_call(
     return result
 
 
+def _maybe_record_action_receipt(
+    agent,
+    *,
+    function_name: str,
+    function_args: Any,
+    result: Any,
+    effective_task_id: str,
+    tool_call_id: str,
+    duration_s: float,
+    exit_status: str,
+) -> None:
+    """Record one shadow action receipt for a tool call that actually ran.
+
+    Default-off observability, gated on ``observability.action_receipts.enabled``.
+    When that setting is absent or false this returns after a single boolean
+    check — no envelope is built and no database is opened or created.
+
+    Every failure here is swallowed. This is telemetry: it must never change
+    what a tool did, what the model sees, or the order it sees it in. Callers
+    are responsible for invoking it only for calls that actually started —
+    malformed, preflight-blocked, and skipped-before-start calls never reach it.
+    """
+    try:
+        from agent.action_receipts import ActionReceiptLedger, is_enabled
+
+        if not is_enabled():
+            return
+
+        from agent.phase2_enforcement import current_sealed_envelope
+        from agent.task_envelope import build_shadow_envelope
+
+        try:
+            cwd = getattr(get_active_env(effective_task_id), "cwd", None)
+        except Exception:
+            cwd = None
+
+        session_id = getattr(agent, "session_id", "") or None
+        envelope = current_sealed_envelope()
+        if envelope is None:
+            envelope = build_shadow_envelope(
+                tool_name=function_name,
+                args=function_args,
+                cwd=str(cwd) if cwd else None,
+                session_id=session_id,
+                task_id=effective_task_id or None,
+                tool_call_id=tool_call_id or None,
+            )
+        receipt_cwd = (
+            getattr(envelope, "cwd", None)
+            if not isinstance(envelope, Mapping)
+            else str(cwd) if cwd else None
+        )
+        ActionReceiptLedger().record_receipt(
+            tool_name=function_name,
+            args=function_args,
+            output=result,
+            exit_status=exit_status,
+            duration_ms=int(duration_s * 1000),
+            session_id=session_id,
+            task_id=effective_task_id or None,
+            tool_call_id=tool_call_id or None,
+            cwd=receipt_cwd,
+            envelope=envelope,
+        )
+    except Exception as exc:
+        logger.warning("action receipt write failed for %s: %s", function_name, exc)
+
+
 def _tool_search_scoped_names(agent) -> frozenset:
     """Return the deferrable tool names the session may invoke via tool_call.
 
@@ -535,6 +604,79 @@ def _managed_values(
     )
 
 
+def _phase2_enforcement_block(
+    *,
+    function_name: str,
+    function_args: dict,
+    effective_task_id: str,
+) -> Optional[str]:
+    """Return a serialized fail-closed Phase 2 block, or ``None``."""
+    from agent import phase2_enforcement
+
+    try:
+        cwd = getattr(get_active_env(effective_task_id), "cwd", None)
+    except Exception:
+        cwd = None
+    destructive = (
+        function_name == "terminal"
+        and _is_destructive_command(str(function_args.get("command", "")))
+    )
+    try:
+        decision = phase2_enforcement.evaluate_tool_call(
+            function_name,
+            function_args,
+            cwd=str(cwd) if cwd else None,
+            destructive=destructive,
+        )
+    except Exception:
+        if not phase2_enforcement.is_enabled():
+            return None
+        logger.exception("Phase 2 envelope enforcement failed closed")
+        return json.dumps(
+            {
+                "error": "Task-envelope enforcement failed closed",
+                "status": "blocked",
+                "error_type": "envelope_enforcement_block",
+                "code": "enforcement_internal_error",
+                "details": [],
+            },
+            ensure_ascii=False,
+        )
+    return None if decision is None else json.dumps(decision.to_dict(), ensure_ascii=False)
+
+
+def _phase2_idempotency_block(
+    *, function_name: str, function_args: dict
+) -> Optional[str]:
+    """Atomically claim a mutating operation immediately before dispatch."""
+    from agent import phase2_enforcement
+
+    try:
+        decision = phase2_enforcement.claim_mutating_tool(function_name, function_args)
+    except Exception:
+        if not phase2_enforcement.is_enabled():
+            return None
+        logger.exception("Phase 2 idempotency claim failed closed")
+        decision = phase2_enforcement.EnforcementBlock(
+            "idempotency_internal_error",
+            "Phase 2 idempotency enforcement failed closed",
+        )
+    return None if decision is None else json.dumps(decision.to_dict(), ensure_ascii=False)
+
+
+def _serialized_phase2_block_error_type(block_message: str) -> str:
+    try:
+        payload = json.loads(block_message)
+    except (TypeError, ValueError):
+        return "envelope_enforcement_block"
+    code = payload.get("code") if isinstance(payload, dict) else None
+    return (
+        "idempotency_enforcement_block"
+        if code and "idempotency" in str(code)
+        else "envelope_enforcement_block"
+    )
+
+
 # Cadence for the in-flight tool activity heartbeat. Must stay far below the
 # gateway turn-inactivity timeout (default 1800s) so a silent-but-healthy
 # tool call never looks idle to the watchdog.
@@ -592,8 +734,29 @@ def _run_agent_tool_execution_middleware(
     middleware_trace: list[dict[str, Any]] | None = None,
     begin_execution=None,
     authorization_gate: _ConcurrentToolAuthorizationGate | None = None,
+    on_dispatch=None,
+    cancel_receipt: bool | Callable[[], bool] = True,
+    dispatch_observer=None,
 ) -> _ManagedToolResult:
-    """Run Relay rewrites before Hermes policy and dispatch exactly once."""
+    """Run Relay rewrites before Hermes policy and dispatch exactly once.
+
+    ``on_dispatch`` fires on the worker thread at the single point where the
+    call is past every preflight gate (scope block, ``pre_tool_call`` plugins,
+    guardrails, start-order abandonment) and is about to enter the tool. It is
+    the "actually started" signal the shadow action-receipt ledger keys on:
+    a call that never reaches it produced no side effect and must produce no
+    receipt, while a call that reaches it is owed exactly one receipt even if
+    the worker is later abandoned by a timeout and never returns.
+
+    ``cancel_receipt`` keeps that invariant when a ``KeyboardInterrupt`` unwinds
+    the call instead of returning one: a tool that had already started is owed
+    its receipt here, because no ``_ManagedToolResult`` will ever reach the
+    caller. Callers that do their own claim-guarded bookkeeping across a batch
+    (the concurrent path) pass ``False`` and record it themselves; a callable is
+    called at cancellation time and must return whether this call may claim the
+    slot, which is how the sequential funnel keeps an abandoned worker from
+    writing a second receipt for a call the turn already attested.
+    """
     from agent import relay_tools
     from hermes_cli.middleware import (
         apply_tool_request_middleware,
@@ -605,17 +768,18 @@ def _run_agent_tool_execution_middleware(
         "args": function_args,
         "middleware_trace": trace,
         "blocked": False,
+        "authorized": False,
         "dispatched": False,
     }
     dispatch_lock = threading.Lock()
 
     def _authorized_dispatch(final_args: dict[str, Any]) -> Any:
         with dispatch_lock:
-            if state["dispatched"]:
+            if state["authorized"]:
                 raise RuntimeError(
                     "Hermes tool execution callback invoked more than once"
                 )
-            state["dispatched"] = True
+            state["authorized"] = True
             state["blocked"] = False
             state["args"] = final_args
 
@@ -638,6 +802,16 @@ def _run_agent_tool_execution_middleware(
 
         block_message = scope_block
         block_error_type = "tool_scope_block"
+        if block_message is None:
+            block_message = _phase2_enforcement_block(
+                function_name=function_name,
+                function_args=final_args,
+                effective_task_id=effective_task_id,
+            )
+            block_error_type = _serialized_phase2_block_error_type(
+                block_message or ""
+            )
+
         if block_message is None:
             block_error_type = "plugin_block"
 
@@ -678,11 +852,34 @@ def _run_agent_tool_execution_middleware(
             if guardrail_decision.allows_execution:
                 guardrail_decision = None
 
+        start_order_advanced = False
+        if block_message is None and guardrail_decision is None:
+            # Mutating claims must follow model order. Otherwise concurrent
+            # workers race for the durable idempotency key and a later call can
+            # become the sole dispatch winner.
+            if begin_execution is not None:
+                _advance_start_order()
+                start_order_advanced = True
+            block_message = _phase2_idempotency_block(
+                function_name=function_name,
+                function_args=final_args,
+            )
+            if block_message is not None:
+                block_error_type = _serialized_phase2_block_error_type(block_message)
+
         if block_message is not None or guardrail_decision is not None:
             _advance_start_order()
             state["blocked"] = True
             if block_message is not None:
-                result = json.dumps({"error": block_message}, ensure_ascii=False)
+                try:
+                    parsed_block = json.loads(block_message)
+                except (TypeError, ValueError):
+                    parsed_block = None
+                result = (
+                    block_message
+                    if isinstance(parsed_block, dict)
+                    else json.dumps({"error": block_message}, ensure_ascii=False)
+                )
                 error_type = block_error_type
                 error_message = block_message
             else:
@@ -711,7 +908,22 @@ def _run_agent_tool_execution_middleware(
         elif function_name == "skill_manage":
             agent._iters_since_skill = 0
 
-        _advance_start_order(_begin)
+        if start_order_advanced:
+            _begin()
+        else:
+            _advance_start_order(_begin)
+        if dispatch_observer is not None:
+            dispatch_observer(final_args, list(state["middleware_trace"]))
+        state["dispatched"] = True
+
+        # Past every preflight gate and past start-order abandonment: the tool
+        # is about to run. Anything that keys on "this call actually started"
+        # (the shadow receipt ledger) latches here, never earlier.
+        if on_dispatch is not None:
+            try:
+                on_dispatch(final_args)
+            except Exception:
+                logger.debug("on_dispatch hook failed", exc_info=True)
 
         # Keep the gateway turn-inactivity watchdog from abandoning a turn
         # whose tool call runs silently for longer than the inactivity
@@ -729,7 +941,13 @@ def _run_agent_tool_execution_middleware(
         )
         _hb_thread.start()
         try:
-            return execute(final_args)
+            result = execute(final_args)
+            from agent.phase2_enforcement import rebind_delegated_execution_authority
+
+            rebind_block = rebind_delegated_execution_authority(function_name)
+            if rebind_block is not None:
+                raise RuntimeError(rebind_block.message)
+            return result
         finally:
             _hb_stop.set()
             _hb_thread.join(timeout=2.0)
@@ -766,18 +984,50 @@ def _run_agent_tool_execution_middleware(
             api_request_id=getattr(agent, "_current_api_request_id", "") or "",
         )
 
-    result, _relay_args = relay_tools.execute(
-        function_name,
-        function_args,
-        _hermes_pipeline,
-        session_id=str(getattr(agent, "session_id", "") or ""),
-        metadata={
-            "task_id": effective_task_id or "",
-            "turn_id": getattr(agent, "_current_turn_id", "") or "",
-            "api_request_id": getattr(agent, "_current_api_request_id", "") or "",
-            "tool_call_id": tool_call_id or "",
-        },
-    )
+    _started_at = time.time()
+    try:
+        result, _relay_args = relay_tools.execute(
+            function_name,
+            function_args,
+            _hermes_pipeline,
+            session_id=str(getattr(agent, "session_id", "") or ""),
+            metadata={
+                "task_id": effective_task_id or "",
+                "turn_id": getattr(agent, "_current_turn_id", "") or "",
+                "api_request_id": getattr(agent, "_current_api_request_id", "") or "",
+                "tool_call_id": tool_call_id or "",
+            },
+        )
+    except BaseException as exc:
+        # The outer sequential path converts this unwind into the model-facing
+        # result but does not know the final middleware arguments. Record here,
+        # contending with the timeout/cancellation path through one receipt slot.
+        # Concurrent workers pass False because their own indexed receipt slot
+        # owns both normal and exceptional completion.
+        _may_record = cancel_receipt() if callable(cancel_receipt) else cancel_receipt
+        if _may_record and state["dispatched"]:
+            _cancelled = isinstance(exc, KeyboardInterrupt)
+            _maybe_record_action_receipt(
+                agent,
+                function_name=function_name,
+                function_args=state["args"],
+                result=(
+                    _cancelled_tool_result()
+                    if _cancelled
+                    else f"Error executing tool '{function_name}': {exc}"
+                ),
+                effective_task_id=effective_task_id,
+                tool_call_id=tool_call_id,
+                duration_s=time.time() - _started_at,
+                exit_status="cancelled" if _cancelled else "error",
+            )
+        raise
+    if state["dispatched"]:
+        from agent.phase2_enforcement import rebind_delegated_execution_authority
+
+        rebind_block = rebind_delegated_execution_authority(function_name)
+        if rebind_block is not None:
+            raise RuntimeError(rebind_block.message)
     return _ManagedToolResult(
         result=result,
         args=state["args"],
@@ -853,6 +1103,13 @@ def _run_sequential_tool_execution_middleware(
 
     authorization_gate = _ConcurrentToolAuthorizationGate()
     worker_tid: list[int] = []
+    # One receipt slot for this call, contended between the worker (if
+    # cancellation unwinds it) and the turn (if it abandons the worker and
+    # synthesizes a result). Whoever wins reports; the loser stays silent.
+    _receipt_slot = threading.Lock()
+
+    def _claim_receipt_slot() -> bool:
+        return _receipt_slot.acquire(blocking=False)
 
     def _run() -> _ManagedToolResult:
         tid = threading.current_thread().ident
@@ -861,7 +1118,10 @@ def _run_sequential_tool_execution_middleware(
             agent._tool_worker_threads.add(tid)
         try:
             return _run_agent_tool_execution_middleware(
-                agent, authorization_gate=authorization_gate, **kwargs
+                agent,
+                authorization_gate=authorization_gate,
+                cancel_receipt=_claim_receipt_slot,
+                **kwargs,
             )
         finally:
             with agent._tool_worker_threads_lock:
@@ -894,7 +1154,16 @@ def _run_sequential_tool_execution_middleware(
                     break
                 wait_slice = min(wait_slice, remaining)
             try:
-                return future.result(timeout=wait_slice)
+                outcome = future.result(timeout=wait_slice)
+                if outcome.dispatched:
+                    from agent.phase2_enforcement import (
+                        rebind_delegated_execution_authority,
+                    )
+
+                    rebind_block = rebind_delegated_execution_authority(function_name)
+                    if rebind_block is not None:
+                        raise RuntimeError(rebind_block.message)
+                return outcome
             except concurrent.futures.TimeoutError:
                 if agent._interrupt_requested:
                     interrupted = True
@@ -957,7 +1226,10 @@ def _run_sequential_tool_execution_middleware(
                 args=function_args,
                 middleware_trace=trace,
                 blocked=False,
-                dispatched=True,
+                # False only when the abandoned worker already claimed the
+                # receipt slot on its way out — the call still ran, but the
+                # turn must not attest it twice.
+                dispatched=_claim_receipt_slot(),
             )
 
         # Only reachable when a deadline exists (interrupted returns above).
@@ -994,7 +1266,7 @@ def _run_sequential_tool_execution_middleware(
             args=function_args,
             middleware_trace=trace,
             blocked=False,
-            dispatched=True,
+            dispatched=_claim_receipt_slot(),
         )
     finally:
         # Never join a wedged worker. DaemonThreadPoolExecutor also keeps it out
@@ -1221,9 +1493,40 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
     # ── Concurrent execution ─────────────────────────────────────────
     # Each slot holds (function_name, function_args, function_result, duration, error_flag, blocked_flag, middleware_trace)
     results = [None] * num_tools
+
     for i, (tc, name, args, middleware_trace, block_result, _scope_block) in enumerate(parsed_calls):
         if block_result is not None:
             results[i] = (name, args, block_result, 0.0, True, True, middleware_trace)
+
+    # ── Shadow action-receipt bookkeeping ────────────────────────────
+    # Two facts the receipt invariant needs, shared across the worker threads
+    # and the post-execution loop on the main thread:
+    #   started_indices  — the call got past every preflight gate and entered
+    #                      the tool, so it is owed exactly one receipt.
+    #   receipt_claimed  — that receipt has been written. A worker abandoned by
+    #                      the batch deadline has its receipt written by the
+    #                      main thread; if the worker then finishes late it
+    #                      finds the slot claimed and cannot append a second.
+    receipt_state_lock = threading.Lock()
+    started_indices: set[int] = set()
+    receipt_claimed: set[int] = set()
+
+    def _mark_started(index: int) -> None:
+        with receipt_state_lock:
+            started_indices.add(index)
+
+    def _claim_receipt(index: int) -> bool:
+        """Reserve the single receipt slot for ``index``.
+
+        False when the call never started (nothing ran, so nothing to attest)
+        or when its receipt was already written — the two halves of "exactly
+        one receipt per actually-started tool call".
+        """
+        with receipt_state_lock:
+            if index not in started_indices or index in receipt_claimed:
+                return False
+            receipt_claimed.add(index)
+            return True
 
     start_condition = threading.Condition()
     next_start_order = 0
@@ -1352,6 +1655,14 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
         dispatched = False
         start_advanced = False
 
+        def _observe_dispatch(final_args, trace) -> None:
+            nonlocal dispatched, function_args, middleware_trace
+            dispatched = True
+            function_args = final_args
+            middleware_trace = trace
+            with receipt_state_lock:
+                started_indices.add(index)
+
         def _advance_start(callback=None) -> None:
             nonlocal start_advanced
             if start_advanced:
@@ -1397,6 +1708,8 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                     middleware_trace=middleware_trace,
                     begin_execution=_advance_start,
                     authorization_gate=authorization_gate,
+                    cancel_receipt=False,
+                    dispatch_observer=_observe_dispatch,
                 )
                 result = managed.result
                 function_args = managed.args
@@ -1430,6 +1743,17 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                 )
                 duration = time.time() - start
                 logger.info("tool %s cancelled (%.2fs)", function_name, duration)
+                if dispatched and _claim_receipt(index):
+                    _maybe_record_action_receipt(
+                        agent,
+                        function_name=function_name,
+                        function_args=function_args,
+                        result=result,
+                        effective_task_id=effective_task_id,
+                        tool_call_id=_pairing_tool_call_id(tool_call),
+                        duration_s=duration,
+                        exit_status="cancelled",
+                    )
                 results[index] = (
                     function_name,
                     function_args,
@@ -1456,10 +1780,35 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                     middleware_trace=list(middleware_trace),
                 )
             is_error, _ = _detect_tool_failure(function_name, result)
+            if dispatched and _claim_receipt(index):
+                _maybe_record_action_receipt(
+                    agent,
+                    function_name=function_name,
+                    function_args=function_args,
+                    result=result,
+                    effective_task_id=effective_task_id,
+                    tool_call_id=_pairing_tool_call_id(tool_call),
+                    duration_s=duration,
+                    exit_status="error" if is_error else "ok",
+                )
             if is_error:
                 logger.info("tool %s failed (%.2fs): %s", function_name, duration, result[:200])
             else:
                 logger.info("tool %s completed (%.2fs, %d chars)", function_name, duration, len(result))
+            # Receipt for a call that reached dispatch. _claim_receipt is false
+            # for preflight-blocked calls (on_dispatch never fired) and for any
+            # index the abandonment sweep below already attested.
+            if _claim_receipt(index):
+                _maybe_record_action_receipt(
+                    agent,
+                    function_name=function_name,
+                    function_args=function_args,
+                    result=result,
+                    effective_task_id=effective_task_id,
+                    tool_call_id=_pairing_tool_call_id(tool_call),
+                    duration_s=duration,
+                    exit_status="error" if is_error else "ok",
+                )
             results[index] = (
                 function_name,
                 function_args,
@@ -1729,6 +2078,21 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                 middleware_trace=list(middleware_trace),
             )
             tool_duration = float(timeout_s or 0.0)
+            # Durable receipt for a started call the turn abandoned. The worker
+            # is still wedged in dispatch and may never come back, so the turn
+            # attests on its behalf; _claim_receipt keeps it to exactly one if
+            # the worker does surface later.
+            if _claim_receipt(i):
+                _maybe_record_action_receipt(
+                    agent,
+                    function_name=name,
+                    function_args=args,
+                    result=function_result,
+                    effective_task_id=effective_task_id,
+                    tool_call_id=_pairing_tool_call_id(tc),
+                    duration_s=tool_duration,
+                    exit_status="timeout",
+                )
         elif r is None:
             # Tool was cancelled (interrupt) or thread didn't return
             if agent._interrupt_requested:
@@ -1760,6 +2124,19 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                     middleware_trace=list(middleware_trace),
                 )
             tool_duration = 0.0
+            if _claim_receipt(i):
+                _maybe_record_action_receipt(
+                    agent,
+                    function_name=name,
+                    function_args=args,
+                    result=function_result,
+                    effective_task_id=effective_task_id,
+                    tool_call_id=_pairing_tool_call_id(tc),
+                    duration_s=tool_duration,
+                    exit_status=(
+                        "cancelled" if agent._interrupt_requested else "error"
+                    ),
+                )
         else:
             function_name, function_args, function_result, tool_duration, is_error, blocked, middleware_trace = r
             name = function_name
@@ -2377,7 +2754,7 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                 function_name=function_name,
                 function_args=function_args,
                 effective_task_id=effective_task_id,
-                tool_call_id=getattr(tool_call, "id", "") or "",
+                tool_call_id=_pairing_tool_call_id(tool_call),
                 execute=_execute,
                 scope_block=_ts_scope_block,
                 display_index=i,
@@ -2667,6 +3044,9 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
         _execution_timed_out = isinstance(
             function_result, (_ToolTimeoutResult, _ToolCancelledResult)
         )
+        # Guardrail observations below are model-facing annotations appended
+        # after the fact; the receipt attests the bytes the tool itself emitted.
+        _receipt_output = function_result
         if isinstance(function_result, str):
             result_preview = function_result if agent.verbose_logging else (
                 function_result[:200] if len(function_result) > 200 else function_result
@@ -2717,6 +3097,31 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
             logger.warning("Tool %s returned error (%.2fs): %s", function_name, tool_duration, result_preview)
         else:
             logger.info("tool %s completed (%.2fs, %d chars)", function_name, tool_duration, _result_len)
+
+        # Shadow receipt for a call that actually ran. Malformed-argument and
+        # interrupt-skipped calls left the loop earlier; blocked calls never
+        # dispatched; cancelled ones were attested as they unwound. A tool the
+        # sequential funnel abandoned on its deadline is still owed a durable
+        # receipt, so the timeout marker records rather than suppresses.
+        if _execution_dispatched and not _execution_blocked:
+            _maybe_record_action_receipt(
+                agent,
+                function_name=function_name,
+                function_args=function_args,
+                result=_receipt_output,
+                effective_task_id=effective_task_id,
+                tool_call_id=_pairing_tool_call_id(tool_call),
+                duration_s=tool_duration,
+                exit_status=(
+                    "timeout"
+                    if isinstance(_receipt_output, _ToolTimeoutResult)
+                    else "cancelled"
+                    if isinstance(_receipt_output, _ToolCancelledResult)
+                    else "error"
+                    if _is_error_result
+                    else "ok"
+                ),
+            )
 
         # Track file-mutation outcome for the turn-end verifier.  See
         # the concurrent path for the rationale; both paths must feed

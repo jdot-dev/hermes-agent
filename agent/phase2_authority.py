@@ -307,6 +307,52 @@ class Phase2AuthorityStore:
             (graph_id, node_id),
         ).fetchone()
 
+    @classmethod
+    def _node_authority(
+        cls, conn: sqlite3.Connection, graph_id: str, node_id: str
+    ) -> dict[str, Any] | None:
+        """Fold the current fence's lifecycle events into one authority view.
+
+        Returns the current fence, the authoritative envelope (with the latest
+        renewal applied), and whether the lease has been revoked or the node
+        completed. A superseded fence is not represented here — only the newest
+        ``LEASE_GRANTED`` establishes the current fence, and any renewal,
+        revocation, or completion is scoped to that fence.
+        """
+
+        grant = cls._latest_grant(conn, graph_id, node_id)
+        if grant is None:
+            return None
+        fence = int(grant["fence"])
+        envelope = json.loads(grant["payload_json"])["envelope"]
+        rows = conn.execute(
+            """SELECT kind, payload_json FROM authority_events
+               WHERE graph_id = ? AND node_id = ? AND fence = ?
+                 AND kind IN ('LEASE_RENEWED', 'LEASE_REVOKED', 'NODE_COMPLETED')
+               ORDER BY id""",
+            (graph_id, node_id, fence),
+        ).fetchall()
+        revoked = False
+        completed = False
+        for row in rows:
+            if row["kind"] == "LEASE_RENEWED":
+                envelope = json.loads(row["payload_json"])["envelope"]
+            elif row["kind"] == "LEASE_REVOKED":
+                revoked = True
+            elif row["kind"] == "NODE_COMPLETED":
+                completed = True
+        return {
+            "fence": fence,
+            "envelope": envelope,
+            "revoked": revoked,
+            "completed": completed,
+        }
+
+    @staticmethod
+    def _lease_expiry(envelope: Mapping[str, Any]) -> datetime:
+        lease = envelope["lease"]
+        return _parse_time(lease["granted_utc"]) + timedelta(seconds=float(lease["ttl_s"]))
+
     def grant_node(
         self,
         graph_id: str,
@@ -332,15 +378,13 @@ class Phase2AuthorityStore:
             try:
                 conn.execute("BEGIN IMMEDIATE")
                 plan, node = self._load_plan_node(conn, graph_id, node_id)
-                previous = self._latest_grant(conn, graph_id, node_id)
-                if previous is not None:
-                    previous_payload = json.loads(previous["payload_json"])
-                    expires = _parse_time(previous_payload["envelope"]["lease"]["granted_utc"]) + timedelta(
-                        seconds=float(previous_payload["envelope"]["lease"]["ttl_s"])
-                    )
-                    if granted_at < expires:
-                        raise AuthorityError("node already has an active lease")
-                    fence = int(previous["fence"]) + 1
+                authority = self._node_authority(conn, graph_id, node_id)
+                if authority is not None:
+                    if not authority["revoked"] and not authority["completed"]:
+                        expires = self._lease_expiry(authority["envelope"])
+                        if granted_at < expires:
+                            raise AuthorityError("node already has an active lease")
+                    fence = authority["fence"] + 1
                 else:
                     fence = 1
                 envelope = {
@@ -382,6 +426,200 @@ class Phase2AuthorityStore:
             finally:
                 conn.close()
 
+    def _load_live_authority(
+        self,
+        conn: sqlite3.Connection,
+        envelope: Mapping[str, Any],
+        current: datetime,
+        *,
+        action: str,
+    ) -> tuple[str, str, int, dict[str, Any]]:
+        """Return the authoritative envelope for a lifecycle transition or fail.
+
+        A transition is only legal for the holder/attempt/fence that currently
+        owns the node under an unexpired, un-revoked, non-terminal lease. This is
+        the shared fail-closed gate for renew/revoke/complete (contract §9).
+        """
+
+        graph_id = str(envelope.get("graph_id"))
+        node_id = str(envelope.get("node_id"))
+        authority = self._node_authority(conn, graph_id, node_id)
+        if authority is None or envelope.get("fence") != authority["fence"]:
+            raise AuthorityError(f"stale fence cannot {action}")
+        authoritative = authority["envelope"]
+        if authoritative.get("attempt_id") != envelope.get("attempt_id"):
+            raise AuthorityError(f"stale attempt cannot {action}")
+        env_lease = envelope.get("lease")
+        if not isinstance(env_lease, Mapping) or env_lease.get("holder") != authoritative[
+            "lease"
+        ].get("holder"):
+            raise AuthorityError(f"lease holder cannot {action}")
+        if authority["completed"]:
+            raise AuthorityError("node already completed")
+        if authority["revoked"]:
+            raise AuthorityError(f"revoked lease cannot {action}")
+        if _canonical_json(dict(envelope)) != _canonical_json(authoritative):
+            raise AuthorityError(f"non-authoritative envelope cannot {action}")
+        if current >= self._lease_expiry(authoritative):
+            raise AuthorityError(f"expired lease cannot {action}")
+        if current >= _parse_time(authoritative["deadline_utc"]):
+            raise AuthorityError(f"expired deadline cannot {action}")
+        return graph_id, node_id, authority["fence"], authoritative
+
+    def renew_node(
+        self,
+        envelope: Mapping[str, Any],
+        *,
+        ttl_s: float,
+        now: datetime | None = None,
+    ) -> dict[str, Any]:
+        """Atomically extend the active lease without changing node authority.
+
+        Renewal keeps ``graph_id``/``node_id``/``attempt_id``/``fence`` and the
+        lease holder fixed; only ``granted_utc``/``ttl_s`` advance. It refuses to
+        revive an expired, revoked, or terminal lease so a dead node can never be
+        resurrected in place (contract §9).
+        """
+
+        renewed_at = _utc(now)
+        ttl = _nonnegative_number(ttl_s, "ttl_s")
+        if ttl == 0:
+            raise AuthorityError("ttl_s must be greater than zero")
+        with _DB_LOCK:
+            conn = self._connect()
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                graph_id, node_id, fence, authoritative = self._load_live_authority(
+                    conn, envelope, renewed_at, action="renew"
+                )
+                renewed = json.loads(_canonical_json(authoritative))
+                renewed["lease"] = {
+                    **renewed["lease"],
+                    "granted_utc": _iso(renewed_at),
+                    "ttl_s": ttl,
+                }
+                errors = validate_sealed_envelope(renewed)
+                if errors:
+                    raise AuthorityError("invalid renewed envelope: " + ", ".join(errors))
+                self._append_event(
+                    conn,
+                    kind="LEASE_RENEWED",
+                    graph_id=graph_id,
+                    node_id=node_id,
+                    attempt_id=str(envelope["attempt_id"]),
+                    fence=fence,
+                    payload={"envelope": renewed},
+                    now=renewed_at,
+                )
+                conn.execute("COMMIT")
+                return renewed
+            except Exception:
+                try:
+                    conn.execute("ROLLBACK")
+                except Exception:
+                    pass
+                raise
+            finally:
+                conn.close()
+
+    def revoke_node(
+        self, envelope: Mapping[str, Any], *, now: datetime | None = None
+    ) -> dict[str, Any]:
+        """Cancel the current lease so the node can be immediately regranted.
+
+        After revocation the old envelope validates ``lease_revoked``/``stale_fence``
+        and can never authorize execution; a fresh ``grant_node`` issues the next
+        monotonic fence without waiting for the original TTL to elapse.
+        """
+
+        revoked_at = _utc(now)
+        with _DB_LOCK:
+            conn = self._connect()
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                graph_id = str(envelope.get("graph_id"))
+                node_id = str(envelope.get("node_id"))
+                authority = self._node_authority(conn, graph_id, node_id)
+                if authority is None or envelope.get("fence") != authority["fence"]:
+                    raise AuthorityError("stale fence cannot revoke")
+                if authority["completed"]:
+                    raise AuthorityError("node already completed")
+                if authority["revoked"]:
+                    raise AuthorityError("lease already revoked")
+                authoritative = authority["envelope"]
+                if authoritative.get("attempt_id") != envelope.get("attempt_id"):
+                    raise AuthorityError("stale attempt cannot revoke")
+                self._append_event(
+                    conn,
+                    kind="LEASE_REVOKED",
+                    graph_id=graph_id,
+                    node_id=node_id,
+                    attempt_id=str(authoritative["attempt_id"]),
+                    fence=authority["fence"],
+                    payload={"holder": authoritative["lease"]["holder"]},
+                    now=revoked_at,
+                )
+                conn.execute("COMMIT")
+                return {
+                    "graph_id": graph_id,
+                    "node_id": node_id,
+                    "attempt_id": str(authoritative["attempt_id"]),
+                    "fence": authority["fence"],
+                }
+            except Exception:
+                try:
+                    conn.execute("ROLLBACK")
+                except Exception:
+                    pass
+                raise
+            finally:
+                conn.close()
+
+    def complete_node(
+        self, envelope: Mapping[str, Any], *, now: datetime | None = None
+    ) -> dict[str, Any]:
+        """Accept the current unexpired holder/attempt/fence exactly once.
+
+        Completion is the sole authoritative terminal transition. A stale,
+        expired, revoked, superseded, or already-completed envelope is refused,
+        so duplicate or racing completions cannot both become authoritative
+        (contract §5, §9).
+        """
+
+        completed_at = _utc(now)
+        with _DB_LOCK:
+            conn = self._connect()
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                graph_id, node_id, fence, authoritative = self._load_live_authority(
+                    conn, envelope, completed_at, action="complete"
+                )
+                self._append_event(
+                    conn,
+                    kind="NODE_COMPLETED",
+                    graph_id=graph_id,
+                    node_id=node_id,
+                    attempt_id=str(authoritative["attempt_id"]),
+                    fence=fence,
+                    payload={"holder": authoritative["lease"]["holder"]},
+                    now=completed_at,
+                )
+                conn.execute("COMMIT")
+                return {
+                    "graph_id": graph_id,
+                    "node_id": node_id,
+                    "attempt_id": str(authoritative["attempt_id"]),
+                    "fence": fence,
+                }
+            except Exception:
+                try:
+                    conn.execute("ROLLBACK")
+                except Exception:
+                    pass
+                raise
+            finally:
+                conn.close()
+
     def current_fence(self, graph_id: str, node_id: str) -> int | None:
         conn = self._connect()
         try:
@@ -403,18 +641,22 @@ class Phase2AuthorityStore:
                 )
             except AuthorityError:
                 return sorted(set(errors + ["unknown_graph_node"]))
-            latest = self._latest_grant(
+            authority = self._node_authority(
                 conn, str(envelope.get("graph_id")), str(envelope.get("node_id"))
             )
-            if latest is None or envelope.get("fence") != latest["fence"]:
+            if authority is None or envelope.get("fence") != authority["fence"]:
                 errors.append("stale_fence")
-            if latest is not None:
+            if authority is not None:
                 try:
-                    authoritative = json.loads(latest["payload_json"])["envelope"]
+                    authoritative = authority["envelope"]
                     if _canonical_json(dict(envelope)) != _canonical_json(authoritative):
                         errors.append("envelope_not_authoritative")
                 except (KeyError, TypeError, ValueError):
                     errors.append("authoritative_envelope_invalid")
+                if authority["revoked"]:
+                    errors.append("lease_revoked")
+                if authority["completed"]:
+                    errors.append("node_terminal")
             if envelope.get("planner_hash") != plan["planner_hash"]:
                 errors.append("planner_hash")
             if envelope.get("policy_hash") != plan["policy_hash"]:
@@ -511,14 +753,17 @@ class Phase2AuthorityStore:
                 conn.execute("BEGIN IMMEDIATE")
                 graph_id = str(envelope.get("graph_id"))
                 node_id = str(envelope.get("node_id"))
-                latest = self._latest_grant(conn, graph_id, node_id)
-                if latest is None or envelope.get("fence") != latest["fence"]:
+                authority = self._node_authority(conn, graph_id, node_id)
+                if authority is None or envelope.get("fence") != authority["fence"]:
                     raise AuthorityError("stale fence cannot reserve budget")
-                latest_envelope = json.loads(latest["payload_json"])["envelope"]
+                if authority["revoked"]:
+                    raise AuthorityError("revoked lease cannot reserve budget")
+                if authority["completed"]:
+                    raise AuthorityError("completed node cannot reserve budget")
+                latest_envelope = authority["envelope"]
                 if latest_envelope.get("attempt_id") != envelope.get("attempt_id"):
                     raise AuthorityError("stale attempt cannot reserve budget")
-                granted = _parse_time(latest_envelope["lease"]["granted_utc"])
-                if current >= granted + timedelta(seconds=float(latest_envelope["lease"]["ttl_s"])):
+                if current >= self._lease_expiry(latest_envelope):
                     raise AuthorityError("expired lease cannot reserve budget")
                 state = self._budget_state(conn, graph_id, node_id, int(envelope["fence"]))
                 if state["cost_unknown"]:
@@ -636,6 +881,8 @@ class Phase2AuthorityStore:
                 reservations: dict[str, sqlite3.Row] = {}
                 reconciled: set[str] = set()
                 grants: dict[tuple[str, str, int], dict[str, Any]] = {}
+                renewals: dict[tuple[str, str, int], dict[str, Any]] = {}
+                dead_leases: set[tuple[str, str, int]] = set()
                 for row in rows:
                     try:
                         payload = json.loads(row["payload_json"])
@@ -657,8 +904,15 @@ class Phase2AuthorityStore:
                     if row["prev_event_hash"] != previous_hash or row["event_hash"] != expected:
                         raise AuthorityError("authority event hash chain is invalid")
                     previous_hash = row["event_hash"]
+                    if row["fence"] is None:
+                        continue
+                    key = (row["graph_id"], row["node_id"], int(row["fence"]))
                     if row["kind"] == "LEASE_GRANTED":
-                        grants[(row["graph_id"], row["node_id"], int(row["fence"]))] = payload
+                        grants[key] = payload
+                    elif row["kind"] == "LEASE_RENEWED":
+                        renewals[key] = payload
+                    elif row["kind"] in ("LEASE_REVOKED", "NODE_COMPLETED"):
+                        dead_leases.add(key)
                     elif row["kind"] == "BUDGET_RESERVED":
                         reservations[row["event_id"]] = row
                     elif row["kind"] == "BUDGET_RECONCILED":
@@ -667,25 +921,27 @@ class Phase2AuthorityStore:
                 for reservation_id, reservation in reservations.items():
                     if reservation_id in reconciled:
                         continue
-                    grant = grants.get(
-                        (
-                            reservation["graph_id"],
-                            reservation["node_id"],
-                            int(reservation["fence"]),
-                        )
+                    key = (
+                        reservation["graph_id"],
+                        reservation["node_id"],
+                        int(reservation["fence"]),
                     )
+                    grant = grants.get(key)
                     if grant is None:
                         raise AuthorityError("orphaned reservation has no authoritative lease")
-                    try:
-                        envelope = grant["envelope"]
-                        lease = envelope["lease"]
-                        expires = _parse_time(lease["granted_utc"]) + timedelta(
-                            seconds=float(lease["ttl_s"])
-                        )
-                    except (KeyError, TypeError, ValueError, AuthorityError) as exc:
-                        raise AuthorityError("orphaned reservation lease is invalid") from exc
-                    if current < expires:
-                        continue
+                    # A revoked or completed lease is dead now; renewal extends the
+                    # authoritative expiry. Reconcile only once the live lease is dead.
+                    if key not in dead_leases:
+                        try:
+                            envelope = renewals.get(key, grant)["envelope"]
+                            lease = envelope["lease"]
+                            expires = _parse_time(lease["granted_utc"]) + timedelta(
+                                seconds=float(lease["ttl_s"])
+                            )
+                        except (KeyError, TypeError, ValueError, AuthorityError) as exc:
+                            raise AuthorityError("orphaned reservation lease is invalid") from exc
+                        if current < expires:
+                            continue
                     self._append_event(
                         conn,
                         kind="BUDGET_RECONCILED",

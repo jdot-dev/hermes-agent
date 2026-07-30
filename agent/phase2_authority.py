@@ -35,6 +35,25 @@ _MIGRATION_SAMPLE_MAX = 5
 _SQLITE_INT_MIN = -(2**63)
 _SQLITE_INT_MAX = 2**63 - 1
 
+# A delegation node authorizes dispatching a child, never the child's own
+# inferences or tool actions: contract v2 keeps exactly one execution surface
+# per graph node. Inner work therefore runs under separately sealed descendant
+# nodes reached through immutable edges whose ``dispatch_tool`` is one of these
+# Hermes-owned markers. The markers are never model-facing tool names, so no
+# caller can mint an edge that selects its own execution authority.
+_DELEGATION_SURFACES = {"a2a", "acp_worker"}
+_EXECUTION_EDGE_TOOLS = {
+    "direct_model": "__phase2_model_dispatch__",
+    "local_tool": "__phase2_local_tool__",
+}
+# Ordered policy vocabularies (weakest first) used to reject any descendant that
+# would widen the authority delegated to it.
+_POLICY_RANKS = {
+    "network_policy": {"none": 0, "loopback_only": 1, "allowlist": 2},
+    "exec_policy": {"none": 0, "sandboxed": 1, "host": 2},
+    "destructive_policy": {"forbid": 0, "require_confirmation": 1, "allow_within_roots": 2},
+}
+
 # Lifecycle event kinds. LEASE_GRANTED carries the sole sealed envelope, which
 # stays immutable forever. LEASE_RENEWED carries bounded external metadata only
 # (never an envelope); effective expiry is derived from grant + latest renewal.
@@ -399,6 +418,93 @@ def _canonical_identity(value: Any) -> str | None:
         return _canonical_json(dict(value))
     except (TypeError, ValueError):
         return None
+
+
+def _path_within(value: Any, allowed: list[str]) -> bool:
+    """True when ``value`` is one of ``allowed`` or lives beneath one of them."""
+
+    try:
+        target = Path(str(value)).expanduser().resolve()
+    except (OSError, RuntimeError, ValueError):
+        return False
+    for root in allowed:
+        try:
+            base = Path(str(root)).expanduser().resolve()
+        except (OSError, RuntimeError, ValueError):
+            continue
+        if target == base or base in target.parents:
+            return True
+    return False
+
+
+def _authority_escalations(
+    descendant: Mapping[str, Any], delegated: Mapping[str, Any]
+) -> list[str]:
+    """Return the fields where a descendant would widen its delegated authority.
+
+    Descendant nodes are sealed by the planner, not derived from the delegation
+    node, so this is the seam that keeps a mis-sealed execution node from
+    handing a child more roots, budget, or policy latitude than the delegation
+    it runs under. An empty list means the descendant is fully contained.
+    """
+
+    reasons: list[str] = []
+    for field in ("graph_id", "lane"):
+        if descendant.get(field) != delegated.get(field):
+            reasons.append(field)
+
+    descendant_budgets = descendant.get("budgets") or {}
+    delegated_budgets = delegated.get("budgets") or {}
+    for field in ("usd_max", "tokens_max", "wall_clock_s_max"):
+        try:
+            if float(descendant_budgets[field]) > float(delegated_budgets[field]):
+                reasons.append(f"budgets.{field}")
+        except (KeyError, TypeError, ValueError):
+            reasons.append(f"budgets.{field}")
+    try:
+        if _parse_time(descendant.get("deadline_utc")) > _parse_time(
+            delegated.get("deadline_utc")
+        ):
+            reasons.append("deadline_utc")
+    except AuthorityError:
+        reasons.append("deadline_utc")
+
+    delegated_roots = [str(value) for value in (delegated.get("roots") or [])]
+    descendant_roots = [str(value) for value in (descendant.get("roots") or [])]
+    if not descendant_roots or not all(
+        _path_within(value, delegated_roots) for value in descendant_roots
+    ):
+        reasons.append("roots")
+
+    descendant_perms = descendant.get("permissions") or {}
+    delegated_perms = delegated.get("permissions") or {}
+    for field in ("read", "write"):
+        allowed = [str(value) for value in (delegated_perms.get(field) or [])]
+        if not all(
+            _path_within(value, allowed) for value in (descendant_perms.get(field) or [])
+        ):
+            reasons.append(f"permissions.{field}")
+    if not {str(value) for value in (descendant_perms.get("spawn") or [])} <= {
+        str(value) for value in (delegated_perms.get("spawn") or [])
+    }:
+        reasons.append("permissions.spawn")
+
+    for field, ranks in _POLICY_RANKS.items():
+        descendant_rank = ranks.get(descendant.get(field))
+        delegated_rank = ranks.get(delegated.get(field))
+        if descendant_rank is None or delegated_rank is None:
+            reasons.append(field)
+        elif descendant_rank > delegated_rank:
+            reasons.append(field)
+    if not {
+        str(value).rstrip(".").lower()
+        for value in (descendant.get("network_allowlist") or [])
+    } <= {
+        str(value).rstrip(".").lower()
+        for value in (delegated.get("network_allowlist") or [])
+    }:
+        reasons.append("network_allowlist")
+    return sorted(set(reasons))
 
 
 def _valid_sha256(value: Any, field: str) -> str:
@@ -867,6 +973,94 @@ class Phase2AuthorityStore:
             if _canonical_json(dict(supplied)) != _canonical_json(authoritative):
                 raise AuthorityError("delegate child envelope is not authoritative")
         return resolved
+
+    def resolve_execution_descendant(
+        self,
+        delegated_envelope: Mapping[str, Any],
+        *,
+        surface: str,
+        now: datetime | None = None,
+    ) -> dict[str, Any]:
+        """Resolve the one sealed descendant node that owns an execution surface.
+
+        A delegation node (``a2a``/``acp_worker``) authorizes dispatching a
+        child; it never authorizes the child's own model inferences or tool
+        actions, because contract v2 keeps exactly one execution surface per
+        graph node. Those actions run under separately sealed descendant nodes
+        with their own lease, fence, budget, and receipt chain, reached only
+        through the immutable ``_EXECUTION_EDGE_TOOLS`` edges of the sealed plan.
+
+        Hermes performs the whole resolution server-side: no caller names,
+        supplies, or selects a descendant, exactly one edge may match, the
+        descendant must hold its own current grant, and it may never widen the
+        authority of the delegation node it runs under.
+        """
+
+        marker = _EXECUTION_EDGE_TOOLS.get(surface)
+        if marker is None:
+            raise AuthorityError(f"unsupported execution surface: {surface}")
+        if delegated_envelope.get("execution_surface") not in _DELEGATION_SURFACES:
+            raise AuthorityError("only delegation nodes resolve execution descendants")
+        delegated_errors = self.validate_current(delegated_envelope, now=now)
+        if delegated_errors:
+            raise AuthorityError(
+                "invalid current delegated authority: " + ", ".join(delegated_errors)
+            )
+        graph_id = str(delegated_envelope.get("graph_id"))
+        node_id = str(delegated_envelope.get("node_id"))
+        conn = self._connect()
+        try:
+            row = conn.execute(
+                "SELECT plan_json FROM sealed_plans WHERE graph_id = ?", (graph_id,)
+            ).fetchone()
+            if row is None:
+                raise AuthorityError("unknown sealed delegation graph")
+            raw_edges = json.loads(row["plan_json"]).get("edges")
+            if not isinstance(raw_edges, list):
+                raise AuthorityError("sealed plan has no execution graph edges")
+            matches: list[str] = []
+            for edge in raw_edges:
+                if not isinstance(edge, Mapping):
+                    continue
+                if (
+                    edge.get("dispatch_tool") != marker
+                    or edge.get("parent_node_id") != node_id
+                ):
+                    continue
+                child_node_id = edge.get("child_node_id")
+                if not isinstance(child_node_id, str) or child_node_id in matches:
+                    continue
+                node_row = conn.execute(
+                    "SELECT node_json FROM sealed_nodes WHERE graph_id = ? AND node_id = ?",
+                    (graph_id, child_node_id),
+                ).fetchone()
+                if node_row is None:
+                    continue
+                if json.loads(node_row["node_json"]).get("execution_surface") == surface:
+                    matches.append(child_node_id)
+            if len(matches) != 1:
+                raise AuthorityError(
+                    f"execution descendant resolution for {surface} must have exactly one match"
+                )
+            authority = self._node_authority(conn, graph_id, matches[0])
+            if authority is None:
+                raise AuthorityError("execution descendant has no active sealed authority")
+            descendant = json.loads(_canonical_json(authority["envelope"]))
+        finally:
+            conn.close()
+        if descendant.get("execution_surface") != surface:
+            raise AuthorityError("execution descendant surface is not authoritative")
+        descendant_errors = self.validate_current(descendant, now=now)
+        if descendant_errors:
+            raise AuthorityError(
+                "invalid current execution descendant: " + ", ".join(descendant_errors)
+            )
+        escalations = _authority_escalations(descendant, delegated_envelope)
+        if escalations:
+            raise AuthorityError(
+                "execution descendant widens delegated authority: " + ", ".join(escalations)
+            )
+        return descendant
 
     @staticmethod
     def _load_plan_node(

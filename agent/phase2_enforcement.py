@@ -8,6 +8,7 @@ must bind an already-sealed envelope before enforcement can allow execution.
 from __future__ import annotations
 
 import ipaddress
+import math
 import os
 import re
 import shlex
@@ -204,7 +205,23 @@ def _aware_datetime(value: Any) -> datetime | None:
 
 
 def _nonnegative_number(value: Any) -> bool:
-    return isinstance(value, (int, float)) and not isinstance(value, bool) and value >= 0
+    """True for a finite, non-negative, non-``bool`` number.
+
+    Finiteness is part of the contract, not a nicety. A ``usd_max`` or
+    ``tokens_max`` of ``inf`` is a ceiling that can never be breached, which
+    contradicts §9 ("breach at either level → fail closed"), and ``nan`` defeats
+    every comparison silently (``nan >= limit`` is always False). Neither is
+    representable in JSON, so a sealed envelope carrying one cannot be durably
+    audited or read back by a strict parser, and ``int(inf)`` aborts budget
+    accounting with an untyped ``OverflowError``.
+    """
+
+    return (
+        isinstance(value, (int, float))
+        and not isinstance(value, bool)
+        and value >= 0
+        and math.isfinite(value)
+    )
 
 
 def _nonempty_strings(value: Any, *, allow_empty: bool = True) -> bool:

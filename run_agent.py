@@ -428,6 +428,9 @@ class AIAgent:
     """
 
     phase2_authority: Any
+    # None unless the durable store is quarantined by AuthorityMigrationRequired.
+    # Enforcement is never downgraded to clear this; the store keeps failing closed.
+    phase2_authority_degraded: dict[str, Any] | None
 
     _TOOL_CALL_ARGUMENTS_CORRUPTION_MARKER = (
         "[hermes-agent: tool call arguments were corrupted in this session and "

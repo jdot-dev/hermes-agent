@@ -2,14 +2,18 @@
 
 from __future__ import annotations
 
+import logging
 import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import patch
 
+import pytest
+
 from agent import phase2_enforcement
-from agent.phase2_authority import Phase2AuthorityStore
+from agent.phase2_authority import AuthorityMigrationRequired, Phase2AuthorityStore
 from run_agent import AIAgent
+from tests.agent.test_phase3_authority_integrity import _legacy_duplicate_attempt_db
 
 
 def _node() -> dict:
@@ -38,7 +42,7 @@ def _node() -> dict:
     }
 
 
-def _agent(hermes_home: Path) -> AIAgent:
+def _agent(hermes_home: Path, *, quiet_mode: bool = True) -> AIAgent:
     tool_defs: list[dict] = []
     with (
         patch("run_agent.get_tool_definitions", return_value=tool_defs),
@@ -51,7 +55,7 @@ def _agent(hermes_home: Path) -> AIAgent:
         return AIAgent(
             api_key="test-key",
             base_url="http://127.0.0.1:1/v1",
-            quiet_mode=True,
+            quiet_mode=quiet_mode,
             skip_context_files=True,
             skip_memory=True,
             session_id="session-phase2-startup",
@@ -92,3 +96,115 @@ def test_agent_control_plane_binds_durable_current_node_and_cleans_context():
 
     assert phase2_enforcement.current_sealed_envelope() is None
     assert phase2_enforcement.current_authoritative_fence() is None
+
+
+# ── a legacy store must quarantine at startup, never silently degrade ───────
+
+
+@pytest.fixture
+def quarantined_home(tmp_path) -> Path:
+    """A profile whose authority store carries a pre-index invariant violation."""
+
+    home = tmp_path / "home"
+    home.mkdir()
+    _legacy_duplicate_attempt_db(home, db_name="phase2_authority.db")
+    return home
+
+
+def test_startup_quarantines_a_legacy_store_and_keeps_enforcement_on(
+    quarantined_home, caplog
+):
+    with (
+        patch.object(phase2_enforcement, "is_enabled", return_value=True),
+        caplog.at_level(logging.ERROR, logger="run_agent"),
+    ):
+        agent = _agent(quarantined_home)
+
+        # Startup completes -- the agent must not crash on a legacy profile --
+        # but the store is recorded as unusable, with the operator's next step.
+        degraded = agent.phase2_authority_degraded
+        assert degraded is not None
+        assert degraded["reason"] == "authority_migration_required"
+        assert degraded["db_path"] == str(quarantined_home / "phase2_authority.db")
+        assert degraded["enforcement_enabled"] is True
+        assert [v["invariant"] for v in degraded["violations"]] == [
+            "duplicate_grant_attempt_id"
+        ]
+        violation = degraded["violations"][0]
+        assert violation["index"] == "one_grant_per_attempt"
+        assert violation["violating_groups"] == 1
+        assert violation["sample"] == [{"key": "at-dup", "events": 2}]
+        assert "at-dup" in degraded["detail"]
+        assert "migration_report()" in degraded["detail"]
+
+        # Fail closed, not open: enforcement is still on for this session.
+        assert phase2_enforcement.is_enabled() is True
+
+        # The quarantine is actionable in the log, naming path and remedy.
+        errors = [r for r in caplog.records if r.levelno >= logging.ERROR]
+        assert len(errors) == 1
+        message = errors[0].getMessage()
+        assert "migration" in message.lower()
+        assert str(quarantined_home / "phase2_authority.db") in message
+
+        # No fresh authority is issued from a quarantined store.
+        with pytest.raises(AuthorityMigrationRequired):
+            agent.phase2_authority.grant_node(
+                "g-authority",
+                "n-one",
+                holder="hermes:session-phase2-startup",
+                ttl_s=60,
+                attempt_id="at-new",
+                now=datetime(2026, 7, 30, tzinfo=timezone.utc),
+            )
+
+    # The legacy store is bound as-is: no sidestep copy, no parallel database.
+    assert agent.phase2_authority.db_path == quarantined_home / "phase2_authority.db"
+    assert sorted(p.name for p in quarantined_home.glob("*.db")) == [
+        "phase2_authority.db"
+    ]
+
+    # Its history stays readable and intact for the operator's migration.
+    events = agent.phase2_authority.read_events("g-authority")
+    assert [e["kind"] for e in events] == [
+        "PLAN_SEALED",
+        "LEASE_GRANTED",
+        "LEASE_GRANTED",
+    ]
+    assert agent.phase2_authority.migration_report()["compatible"] is False
+
+
+def test_quarantine_is_announced_to_a_non_quiet_operator(quarantined_home, capsys):
+    with patch.object(phase2_enforcement, "is_enabled", return_value=True):
+        agent = _agent(quarantined_home, quiet_mode=False)
+
+    assert agent.phase2_authority_degraded is not None
+    out = capsys.readouterr().out
+    assert "QUARANTINED" in out
+    assert "duplicate_grant_attempt_id" in out
+
+
+def test_clean_store_starts_undegraded_under_the_same_enforcement_flag(tmp_path):
+    home = tmp_path / "home"
+    home.mkdir()
+
+    with patch.object(phase2_enforcement, "is_enabled", return_value=True):
+        agent = _agent(home)
+
+        # The positive control: same code path, same flag, no false quarantine.
+        assert agent.phase2_authority_degraded is None
+        now = datetime(2026, 7, 30, tzinfo=timezone.utc)
+        agent.phase2_authority.seal_plan(
+            {"contract_version": 2, "graph_id": "g-startup", "nodes": [_node()]},
+            policy_hash="c" * 64,
+            now=now,
+        )
+        envelope = agent.phase2_authority.grant_node(
+            "g-startup",
+            "n-startup",
+            holder="hermes:session-phase2-startup",
+            ttl_s=60,
+            attempt_id="at-startup",
+            now=now,
+        )
+        assert envelope["fence"] == 1

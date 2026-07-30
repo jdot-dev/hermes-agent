@@ -15,13 +15,13 @@ from agent import phase2_enforcement
 def _envelope(root: Path, **overrides):
     now = datetime.now(timezone.utc)
     base = {
-        "envelope_version": 1,
+        "envelope_version": 2,
         "graph_id": "g-phase2-1",
         "node_id": "n-phase2-1",
         "attempt_id": "at-phase2-1",
         "idempotency_key": "d" * 64,
         "objective": "exercise the Phase 2 enforcement contract",
-        "execution_surface": "direct_model",
+        "execution_surface": "local_tool",
         "lane": "hermes",
         "roots": [str(root)],
         "permissions": {
@@ -93,6 +93,49 @@ def test_enabled_without_bound_envelope_fails_closed(monkeypatch, tmp_path):
     )
     assert decision is not None
     assert decision.code == "missing_sealed_envelope"
+
+
+def test_local_tool_dispatch_rejects_direct_model_node(monkeypatch, tmp_path):
+    _set_enabled(monkeypatch, True)
+    envelope = _envelope(tmp_path, execution_surface="direct_model")
+    with phase2_enforcement.bind_sealed_envelope(envelope, current_fence=1):
+        decision = phase2_enforcement.evaluate_tool_call(
+            "read_file", {"path": str(tmp_path / "x")}, cwd=str(tmp_path)
+        )
+    assert decision is not None
+    assert decision.code == "execution_surface_mismatch"
+
+
+def test_model_dispatch_rejects_local_tool_node(monkeypatch, tmp_path):
+    _set_enabled(monkeypatch, True)
+    envelope = _envelope(tmp_path, execution_surface="local_tool")
+    with phase2_enforcement.bind_sealed_envelope(envelope, current_fence=1):
+        decision = phase2_enforcement.evaluate_runtime_authority()
+    assert decision is not None
+    assert decision.code == "execution_surface_mismatch"
+
+
+def test_contract_v1_local_tool_envelope_is_not_silently_reinterpreted(monkeypatch, tmp_path):
+    _set_enabled(monkeypatch, True)
+    envelope = _envelope(tmp_path, envelope_version=1)
+    with phase2_enforcement.bind_sealed_envelope(envelope, current_fence=1):
+        decision = phase2_enforcement.evaluate_tool_call(
+            "read_file", {"path": str(tmp_path / "inside.txt")}, cwd=str(tmp_path)
+        )
+    assert decision is not None
+    assert decision.code == "invalid_sealed_envelope"
+    assert "envelope_version" in decision.details
+
+
+def test_contract_v2_local_tool_is_a_valid_execution_surface(tmp_path):
+    assert phase2_enforcement.validate_sealed_envelope(_envelope(tmp_path)) == []
+
+
+def test_contract_v2_still_rejects_unknown_execution_surfaces(tmp_path):
+    errors = phase2_enforcement.validate_sealed_envelope(
+        _envelope(tmp_path, execution_surface="local_tool_alias")
+    )
+    assert "execution_surface" in errors
 
 
 def test_relative_permission_roots_are_rejected(monkeypatch, tmp_path):

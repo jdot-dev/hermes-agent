@@ -1,25 +1,24 @@
-"""Hermes-owned conversation binding for sealed Phase 2 task envelopes."""
+"""Node-scoped binding contracts for sealed Phase 2 task envelopes."""
 
 from __future__ import annotations
 
+import inspect
 from datetime import datetime, timedelta, timezone
-from types import SimpleNamespace
-from unittest.mock import patch
 
 from agent import phase2_enforcement
 from run_agent import AIAgent
 
 
-def _envelope() -> dict:
+def _envelope(*, node_id: str = "n-bound-node", surface: str = "local_tool") -> dict:
     now = datetime.now(timezone.utc)
     return {
-        "envelope_version": 1,
-        "graph_id": "g-bound-turn",
-        "node_id": "n-bound-turn",
-        "attempt_id": "at-bound-turn",
+        "envelope_version": 2,
+        "graph_id": "g-bound-graph",
+        "node_id": node_id,
+        "attempt_id": f"at-{node_id}",
         "idempotency_key": "d" * 64,
-        "objective": "bind one sealed graph node to one Hermes turn",
-        "execution_surface": "direct_model",
+        "objective": "bind one sealed graph node to one execution surface",
+        "execution_surface": surface,
         "lane": "hermes",
         "roots": ["/tmp"],
         "permissions": {"read": ["/tmp"], "write": [], "spawn": []},
@@ -49,47 +48,42 @@ def _envelope() -> dict:
     }
 
 
-def _agent() -> SimpleNamespace:
-    return SimpleNamespace(
-        _session_db=None,
-        session_id="s-bound-turn",
-        _conversation_root_id=lambda: "s-bound-turn",
-    )
-
-
-def test_run_conversation_binds_sealed_envelope_for_the_whole_turn():
-    observed: dict = {}
-
-    def fake_turn(*args, **kwargs):
+def test_binding_is_node_scoped_and_resets_after_success():
+    with phase2_enforcement.bind_sealed_envelope(_envelope(), current_fence=1):
         current = phase2_enforcement.current_sealed_envelope()
-        observed["graph_id"] = current["graph_id"] if current else None
-        observed["fence"] = phase2_enforcement.current_authoritative_fence()
-        return {"final_response": "ok"}
+        assert current is not None
+        assert current["graph_id"] == "g-bound-graph"
+        assert current["node_id"] == "n-bound-node"
+        assert current["execution_surface"] == "local_tool"
+        assert phase2_enforcement.current_authoritative_fence() == 1
 
-    with patch("agent.conversation_loop.run_conversation", side_effect=fake_turn):
-        result = AIAgent.run_conversation(
-            _agent(),
-            "hello",
-            sealed_envelope=_envelope(),
-            current_fence=1,
-        )
-
-    assert result["final_response"] == "ok"
-    assert observed == {"graph_id": "g-bound-turn", "fence": 1}
     assert phase2_enforcement.current_sealed_envelope() is None
     assert phase2_enforcement.current_authoritative_fence() is None
 
 
-def test_run_conversation_without_envelope_preserves_unbound_context():
-    observed: dict = {}
+def test_binding_resets_after_exception():
+    try:
+        with phase2_enforcement.bind_sealed_envelope(_envelope(), current_fence=1):
+            raise RuntimeError("boom")
+    except RuntimeError:
+        pass
 
-    def fake_turn(*args, **kwargs):
-        observed["envelope"] = phase2_enforcement.current_sealed_envelope()
-        observed["fence"] = phase2_enforcement.current_authoritative_fence()
-        return {"final_response": "ok"}
+    assert phase2_enforcement.current_sealed_envelope() is None
+    assert phase2_enforcement.current_authoritative_fence() is None
 
-    with patch("agent.conversation_loop.run_conversation", side_effect=fake_turn):
-        result = AIAgent.run_conversation(_agent(), "hello")
 
-    assert result["final_response"] == "ok"
-    assert observed == {"envelope": None, "fence": None}
+def test_whole_conversation_binding_is_not_a_public_runtime_api():
+    signature = inspect.signature(AIAgent.run_conversation)
+    assert "sealed_envelope" not in signature.parameters
+    assert "current_fence" not in signature.parameters
+
+
+def test_model_and_tool_nodes_require_distinct_envelopes():
+    model = _envelope(node_id="n-model", surface="direct_model")
+    tool = _envelope(node_id="n-tool", surface="local_tool")
+
+    assert model["node_id"] != tool["node_id"]
+    assert model["execution_surface"] == "direct_model"
+    assert tool["execution_surface"] == "local_tool"
+    assert phase2_enforcement.validate_sealed_envelope(model) == []
+    assert phase2_enforcement.validate_sealed_envelope(tool) == []

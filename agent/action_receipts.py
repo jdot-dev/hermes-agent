@@ -23,13 +23,14 @@ Conventions (WAL, busy timeout, module lock, schema table) mirror
 from __future__ import annotations
 
 import hashlib
+import json
 import re
 import sqlite3
 import threading
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Mapping, Optional
 
 from agent.task_envelope import (
     TaskEnvelope,
@@ -328,7 +329,7 @@ class ActionReceiptLedger:
         tool_call_id: Optional[str] = None,
         cwd: Optional[str] = None,
         kind: str = "tool_exec",
-        envelope: Optional[TaskEnvelope] = None,
+        envelope: Optional[TaskEnvelope | Mapping[str, Any]] = None,
         receipt_id: Optional[str] = None,
         created_at: Optional[str] = None,
     ) -> str:
@@ -349,18 +350,36 @@ class ActionReceiptLedger:
             )
 
         output_text = _output_text(output)
+        if isinstance(envelope, TaskEnvelope):
+            envelope_dict = envelope.to_dict()
+            action_id = envelope.action_id
+            envelope_id = envelope.envelope_id
+            actor_lane = envelope.lane
+            execution_surface = envelope.execution_surface
+        elif isinstance(envelope, Mapping):
+            envelope_dict = json.loads(canonical_json(dict(envelope)))
+            graph_id = str(envelope_dict.get("graph_id") or "")
+            node_id = str(envelope_dict.get("node_id") or "")
+            attempt_id = str(envelope_dict.get("attempt_id") or "")
+            action_id = f"{graph_id}:{node_id}:{attempt_id}"
+            envelope_id = f"se-{canonical_hash(envelope_dict)}"
+            actor_lane = str(envelope_dict.get("lane") or "unknown")
+            execution_surface = str(envelope_dict.get("execution_surface") or "unknown")
+        else:  # pragma: no cover - defensive; construction above always resolves
+            raise TypeError("receipt envelope must be a TaskEnvelope or mapping")
+
         row: dict[str, Any] = {
             "receipt_version": RECEIPT_SCHEMA_VERSION,
             "receipt_id": receipt_id or f"r-{uuid.uuid4().hex}",
             "created_at": created_at or _utc_now(),
             "kind": kind,
-            "action_id": envelope.action_id,
+            "action_id": action_id,
             "session_id": session_id,
             "task_id": task_id,
             "tool_call_id": tool_call_id,
-            "envelope_id": envelope.envelope_id,
-            "actor_lane": envelope.lane,
-            "execution_surface": envelope.execution_surface,
+            "envelope_id": envelope_id,
+            "actor_lane": actor_lane,
+            "execution_surface": execution_surface,
             "tool_name": str(tool_name),
             "exit_status": str(exit_status),
             "duration_ms": int(duration_ms),
@@ -375,8 +394,8 @@ class ActionReceiptLedger:
                 else None
             ),
             "output_bytes": len(output_text.encode("utf-8")),
-            "envelope_hash": envelope_hash(envelope),
-            "envelope_json": canonical_json(envelope.to_dict()),
+            "envelope_hash": canonical_hash(envelope_dict),
+            "envelope_json": canonical_json(envelope_dict),
         }
 
         with _DB_LOCK:

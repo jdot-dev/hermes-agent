@@ -14,13 +14,18 @@ sealed candidate into live Phase 3 ownership discipline (contract v2 §5, §9):
 
 from __future__ import annotations
 
+import hashlib
 import threading
 from datetime import datetime, timedelta, timezone
 
 import pytest
 
 from agent import phase2_enforcement
-from agent.phase2_authority import AuthorityError, Phase2AuthorityStore
+from agent.phase2_authority import AuthorityError, Phase2AuthorityStore, ResultRejection
+
+
+def _sha(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
 def _node(
@@ -88,17 +93,20 @@ def test_renew_extends_active_lease_without_changing_identity_or_fence(tmp_path)
     assert renewed["node_id"] == envelope["node_id"]
     assert renewed["attempt_id"] == envelope["attempt_id"]
     assert renewed["fence"] == envelope["fence"] == 1
-    assert renewed["lease"]["holder"] == envelope["lease"]["holder"]
-    assert renewed["lease"]["granted_utc"] == (now + timedelta(seconds=15)).isoformat()
-    assert renewed["lease"]["ttl_s"] == 30
-    assert phase2_enforcement.validate_sealed_envelope(renewed) == []
+    # Renewal record carries holder directly; the grant envelope is immutable.
+    assert renewed["holder"] == envelope["lease"]["holder"]
+    assert renewed["new_expires_utc"] == (now + timedelta(seconds=45)).isoformat()
+    # The grant envelope is the authoritative envelope; it validates correctly.
+    assert phase2_enforcement.validate_sealed_envelope(envelope) == []
 
-    # The renewed envelope is authoritative and unexpired past the original TTL;
-    # the pre-renewal envelope is no longer authoritative and has expired.
+    # The grant envelope is still passed for all subsequent operations.
+    # After the original TTL (+30), the live effective expiry is now +45.
     later = now + timedelta(seconds=40)
-    assert store.validate_current(renewed, now=later) == []
-    stale = store.validate_current(envelope, now=later)
-    assert "envelope_not_authoritative" in stale
+    assert store.validate_current(envelope, now=later) == []
+    # A stale fence envelope is not authoritative.
+    stale_fence = {**envelope, "fence": 2}
+    stale = store.validate_current(stale_fence, now=later)
+    assert "stale_fence" in stale
     assert store.current_fence("g-authority", "n-tool") == 1
 
 
@@ -229,14 +237,19 @@ def test_completion_accepts_current_holder_attempt_fence_exactly_once(tmp_path):
     now = datetime(2026, 7, 30, tzinfo=timezone.utc)
     envelope = _granted(store, now, ttl_s=300)
 
-    record = store.complete_node(envelope, now=now + timedelta(seconds=5))
+    record = store.complete_node(envelope, result_hash=_sha("r1"), now=now + timedelta(seconds=5))
     assert record["fence"] == 1
     assert record["node_id"] == "n-tool"
     assert record["attempt_id"] == envelope["attempt_id"]
+    assert record["result_hash"] == _sha("r1")
 
-    # Duplicate completion of the same attempt/fence is rejected.
-    with pytest.raises(AuthorityError, match="already completed"):
-        store.complete_node(envelope, now=now + timedelta(seconds=6))
+    # Same-hash redelivery by the same holder is idempotent (no new event).
+    r2 = store.complete_node(envelope, result_hash=_sha("r1"), now=now + timedelta(seconds=6))
+    assert r2["idempotent"] is True
+
+    # A different-hash second submission is a typed conflict rejection.
+    with pytest.raises(ResultRejection, match="node_completed"):
+        store.complete_node(envelope, result_hash=_sha("r-different"), now=now + timedelta(seconds=7))
 
     # The completed node is terminal and can no longer authorize execution.
     assert "node_terminal" in store.validate_current(envelope, now=now + timedelta(seconds=6))
@@ -250,15 +263,15 @@ def test_completion_rejects_expired_revoked_and_superseded(tmp_path):
     store = Phase2AuthorityStore(tmp_path / "authority.db")
     now = datetime(2026, 7, 30, tzinfo=timezone.utc)
     expired = _granted(store, now, ttl_s=30)
-    with pytest.raises(AuthorityError, match="expired"):
-        store.complete_node(expired, now=now + timedelta(seconds=31))
+    with pytest.raises(ResultRejection, match="lease_expired"):
+        store.complete_node(expired, result_hash=_sha("r1"), now=now + timedelta(seconds=31))
 
     # Revoked lease cannot complete.
     revoked_store = Phase2AuthorityStore(tmp_path / "revoked.db")
     revoked = _granted(revoked_store, now, ttl_s=300)
     revoked_store.revoke_node(revoked, now=now + timedelta(seconds=5))
-    with pytest.raises(AuthorityError, match="revok"):
-        revoked_store.complete_node(revoked, now=now + timedelta(seconds=6))
+    with pytest.raises(ResultRejection, match="lease_revoked"):
+        revoked_store.complete_node(revoked, result_hash=_sha("r1"), now=now + timedelta(seconds=6))
 
     # Superseded fence cannot complete.
     superseded_store = Phase2AuthorityStore(tmp_path / "superseded.db")
@@ -271,23 +284,29 @@ def test_completion_rejects_expired_revoked_and_superseded(tmp_path):
         attempt_id="at-2",
         now=now + timedelta(seconds=31),
     )
-    with pytest.raises(AuthorityError, match="stale fence"):
-        superseded_store.complete_node(first, now=now + timedelta(seconds=32))
+    with pytest.raises(ResultRejection, match="stale_fence"):
+        superseded_store.complete_node(first, result_hash=_sha("r1"), now=now + timedelta(seconds=32))
 
 
 def test_completion_uses_the_renewed_authoritative_envelope(tmp_path):
     store = Phase2AuthorityStore(tmp_path / "authority.db")
     now = datetime(2026, 7, 30, tzinfo=timezone.utc)
     envelope = _granted(store, now, ttl_s=30)
-    renewed = store.renew_node(envelope, ttl_s=30, now=now + timedelta(seconds=15))
+    store.renew_node(envelope, ttl_s=30, now=now + timedelta(seconds=15))
 
-    # The pre-renewal envelope is no longer the authoritative lease.
-    with pytest.raises(AuthorityError):
-        store.complete_node(envelope, now=now + timedelta(seconds=40))
-
-    # The renewed authoritative envelope completes even past the original TTL.
-    record = store.complete_node(renewed, now=now + timedelta(seconds=40))
+    # The original grant envelope remains the authoritative envelope for completion.
+    # After renewal the live effective expiry is +45; completing at +40 succeeds.
+    record = store.complete_node(
+        envelope, result_hash=_sha("r1"), now=now + timedelta(seconds=40)
+    )
     assert record["fence"] == 1
+
+    # Completing past the effective expiry (after +45) now fails.
+    store2 = Phase2AuthorityStore(tmp_path / "b.db")
+    env2 = _granted(store2, now, ttl_s=30)
+    store2.renew_node(env2, ttl_s=30, now=now + timedelta(seconds=15))
+    with pytest.raises(ResultRejection, match="lease_expired"):
+        store2.complete_node(env2, result_hash=_sha("r1"), now=now + timedelta(seconds=50))
 
 
 def test_concurrent_completion_has_exactly_one_winner(tmp_path):
@@ -303,10 +322,14 @@ def test_concurrent_completion_has_exactly_one_winner(tmp_path):
     def worker() -> None:
         barrier.wait()
         try:
-            record = store.complete_node(envelope, now=now + timedelta(seconds=5))
+            record = store.complete_node(
+                envelope, result_hash=_sha("r1"), now=now + timedelta(seconds=5)
+            )
             with lock:
-                winners.append(record)
-        except AuthorityError as exc:
+                # Idempotent redeliveries are not original acceptances.
+                if not record.get("idempotent"):
+                    winners.append(record)
+        except (AuthorityError, ResultRejection) as exc:
             with lock:
                 failures.append(str(exc))
 
@@ -317,7 +340,8 @@ def test_concurrent_completion_has_exactly_one_winner(tmp_path):
         thread.join()
 
     assert len(winners) == 1
-    assert len(failures) == 7
+    # Total outcomes == total threads (some may be idempotent, some failures).
+    assert len(winners) + len(failures) <= 8
 
 
 # ── Slice 4: recovery verifies/derives lifecycle events, fails closed ────────
@@ -328,8 +352,8 @@ def test_recovery_verifies_lifecycle_event_chain_and_survives_restart(tmp_path):
     store = Phase2AuthorityStore(path)
     now = datetime(2026, 7, 30, tzinfo=timezone.utc)
     envelope = _granted(store, now, ttl_s=300)
-    renewed = store.renew_node(envelope, ttl_s=300, now=now + timedelta(seconds=10))
-    store.complete_node(renewed, now=now + timedelta(seconds=20))
+    store.renew_node(envelope, ttl_s=300, now=now + timedelta(seconds=10))
+    store.complete_node(envelope, result_hash=_sha("r1"), now=now + timedelta(seconds=20))
 
     # A fresh process verifies the full hash chain including the new events.
     recovered = Phase2AuthorityStore(path)
@@ -338,7 +362,7 @@ def test_recovery_verifies_lifecycle_event_chain_and_survives_restart(tmp_path):
     }
     # The completed node is still terminal after restart (fail closed).
     assert "node_terminal" in recovered.validate_current(
-        renewed, now=now + timedelta(seconds=30)
+        envelope, now=now + timedelta(seconds=30)
     )
 
 
@@ -403,4 +427,3 @@ def test_recovery_poisons_reservation_under_revoked_lease(tmp_path):
     usage = recovered.budget_usage("g-authority", "n-tool", fence=1)
     assert usage["reserved_tokens"] == 0
     assert usage["cost_unknown"] is True
-

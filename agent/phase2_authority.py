@@ -23,10 +23,50 @@ from hermes_constants import get_hermes_home
 _DB_LOCK = threading.Lock()
 _HASH_KEYS = ("idempotency_key", "input_hash")
 _ALLOWED_SURFACES = {"direct_model", "combo", "acp_worker", "a2a", "cloud", "local_tool"}
+_SHA256_RE_LEN = 64
+
+# Lifecycle event kinds. LEASE_GRANTED carries the sole sealed envelope, which
+# stays immutable forever. LEASE_RENEWED carries bounded external metadata only
+# (never an envelope); effective expiry is derived from grant + latest renewal.
+_EVENT_KINDS = (
+    "PLAN_SEALED",
+    "LEASE_GRANTED",
+    "LEASE_RENEWED",
+    "LEASE_REVOKED",
+    "RESULT_ACCEPTED",
+    "RESULT_REJECTED",
+    "NODE_COMPLETED",  # legacy alias folded identically to RESULT_ACCEPTED
+    "BUDGET_RESERVED",
+    "BUDGET_RECONCILED",
+)
+_ACCEPTED_KINDS = ("RESULT_ACCEPTED", "NODE_COMPLETED")
 
 
 class AuthorityError(RuntimeError):
     """A requested authority transition is invalid or unavailable."""
+
+
+class ResultRejection(AuthorityError):
+    """A completion was rejected; exactly one RESULT_REJECTED event was appended.
+
+    The rejection is recorded durably in the same decision transaction, so this
+    exception carries the bounded machine-readable ``reason`` and the
+    ``result_hash`` that was refused.
+    """
+
+    def __init__(self, reason: str, *, result_hash: str | None = None) -> None:
+        super().__init__(f"result rejected: {reason}")
+        self.reason = reason
+        self.result_hash = result_hash
+
+
+class _Reject(Exception):
+    """Internal control-flow signal: one typed rejection must be recorded."""
+
+    def __init__(self, reason: str, *, fence_hint: int | None = None) -> None:
+        super().__init__(reason)
+        self.reason = reason
+        self.fence_hint = fence_hint
 
 
 def default_db_path() -> Path:
@@ -66,6 +106,20 @@ def _nonnegative_number(value: Any, field: str) -> float:
     if isinstance(value, bool) or not isinstance(value, (int, float)) or value < 0:
         raise AuthorityError(f"{field} must be a non-negative number")
     return float(value)
+
+
+def _valid_sha256(value: Any, field: str) -> str:
+    """Return a validated lowercase SHA-256 hex digest or fail closed."""
+
+    if not isinstance(value, str) or len(value) != _SHA256_RE_LEN:
+        raise AuthorityError(f"{field} must be a SHA-256 hex digest")
+    try:
+        int(value, 16)
+    except ValueError as exc:
+        raise AuthorityError(f"{field} must be a SHA-256 hex digest") from exc
+    if value.lower() != value:
+        raise AuthorityError(f"{field} must be a SHA-256 hex digest")
+    return value
 
 
 class Phase2AuthorityStore:
@@ -139,6 +193,9 @@ class Phase2AuthorityStore:
             BEFORE DELETE ON authority_events BEGIN
                 SELECT RAISE(ABORT, 'authority_events is append-only');
             END;
+            CREATE UNIQUE INDEX IF NOT EXISTS one_accepted_result_per_node
+            ON authority_events(graph_id, node_id)
+            WHERE kind = 'RESULT_ACCEPTED';
             """
         )
 
@@ -313,11 +370,13 @@ class Phase2AuthorityStore:
     ) -> dict[str, Any] | None:
         """Fold the current fence's lifecycle events into one authority view.
 
-        Returns the current fence, the authoritative envelope (with the latest
-        renewal applied), and whether the lease has been revoked or the node
-        completed. A superseded fence is not represented here — only the newest
-        ``LEASE_GRANTED`` establishes the current fence, and any renewal,
-        revocation, or completion is scoped to that fence.
+        The sealed ``LEASE_GRANTED`` envelope is immutable: it is returned
+        unchanged regardless of renewals. The current *effective* expiry is
+        derived externally from the grant plus the latest valid ``LEASE_RENEWED``
+        event, never by rewriting envelope bytes. A superseded fence is not
+        represented here — only the newest ``LEASE_GRANTED`` establishes the
+        current fence, and any renewal, revocation, or completion is scoped to
+        that fence.
         """
 
         grant = cls._latest_grant(conn, graph_id, node_id)
@@ -328,30 +387,73 @@ class Phase2AuthorityStore:
         rows = conn.execute(
             """SELECT kind, payload_json FROM authority_events
                WHERE graph_id = ? AND node_id = ? AND fence = ?
-                 AND kind IN ('LEASE_RENEWED', 'LEASE_REVOKED', 'NODE_COMPLETED')
+                 AND kind IN ('LEASE_RENEWED', 'LEASE_REVOKED',
+                              'RESULT_ACCEPTED', 'NODE_COMPLETED')
                ORDER BY id""",
             (graph_id, node_id, fence),
         ).fetchall()
         revoked = False
         completed = False
+        accepted_result_hash: str | None = None
+        new_expires_utc: str | None = None
         for row in rows:
+            payload = json.loads(row["payload_json"])
             if row["kind"] == "LEASE_RENEWED":
-                envelope = json.loads(row["payload_json"])["envelope"]
+                # Bounded external metadata only; never an envelope copy.
+                new_expires_utc = payload["new_expires_utc"]
             elif row["kind"] == "LEASE_REVOKED":
                 revoked = True
-            elif row["kind"] == "NODE_COMPLETED":
+            elif row["kind"] in _ACCEPTED_KINDS:
                 completed = True
+                accepted_result_hash = payload.get("result_hash")
+        base_expiry = cls._lease_expiry(envelope)
+        effective_expiry = (
+            _parse_time(new_expires_utc) if new_expires_utc is not None else base_expiry
+        )
         return {
             "fence": fence,
             "envelope": envelope,
+            "granted_expires": base_expiry,
+            "effective_expires": effective_expiry,
             "revoked": revoked,
             "completed": completed,
+            "accepted_result_hash": accepted_result_hash,
         }
 
     @staticmethod
     def _lease_expiry(envelope: Mapping[str, Any]) -> datetime:
         lease = envelope["lease"]
         return _parse_time(lease["granted_utc"]) + timedelta(seconds=float(lease["ttl_s"]))
+
+    @staticmethod
+    def _terminal_completed(conn: sqlite3.Connection, graph_id: str, node_id: str) -> bool:
+        """True if the node has any terminal acceptance across ALL fences."""
+
+        return (
+            conn.execute(
+                """SELECT 1 FROM authority_events
+                   WHERE graph_id = ? AND node_id = ?
+                     AND kind IN ('RESULT_ACCEPTED', 'NODE_COMPLETED')
+                   LIMIT 1""",
+                (graph_id, node_id),
+            ).fetchone()
+            is not None
+        )
+
+    @staticmethod
+    def _attempt_seen(conn: sqlite3.Connection, graph_id: str, node_id: str, attempt_id: str) -> bool:
+        """True if the attempt_id was ever granted for this graph/node."""
+
+        return (
+            conn.execute(
+                """SELECT 1 FROM authority_events
+                   WHERE graph_id = ? AND node_id = ? AND kind = 'LEASE_GRANTED'
+                     AND attempt_id = ?
+                   LIMIT 1""",
+                (graph_id, node_id, attempt_id),
+            ).fetchone()
+            is not None
+        )
 
     def grant_node(
         self,
@@ -363,7 +465,12 @@ class Phase2AuthorityStore:
         attempt_id: str,
         now: datetime | None = None,
     ) -> dict[str, Any]:
-        """Atomically grant the next monotonic fence and return its sealed envelope."""
+        """Atomically grant the next monotonic fence and return its sealed envelope.
+
+        A node closed by terminal completion can never be regranted. Attempt IDs
+        are single-use across the whole graph/node history and are never reused,
+        including after revocation or natural expiry.
+        """
 
         granted_at = _utc(now)
         if not isinstance(holder, str) or not holder.strip():
@@ -378,11 +485,14 @@ class Phase2AuthorityStore:
             try:
                 conn.execute("BEGIN IMMEDIATE")
                 plan, node = self._load_plan_node(conn, graph_id, node_id)
+                if self._terminal_completed(conn, graph_id, node_id):
+                    raise AuthorityError("node is terminal and cannot be regranted")
+                if self._attempt_seen(conn, graph_id, node_id, attempt_id):
+                    raise AuthorityError(f"attempt_id {attempt_id} was already used for this node")
                 authority = self._node_authority(conn, graph_id, node_id)
                 if authority is not None:
                     if not authority["revoked"] and not authority["completed"]:
-                        expires = self._lease_expiry(authority["envelope"])
-                        if granted_at < expires:
+                        if granted_at < authority["effective_expires"]:
                             raise AuthorityError("node already has an active lease")
                     fence = authority["fence"] + 1
                 else:
@@ -426,19 +536,21 @@ class Phase2AuthorityStore:
             finally:
                 conn.close()
 
-    def _load_live_authority(
+    def _authority_gate(
         self,
         conn: sqlite3.Connection,
         envelope: Mapping[str, Any],
-        current: datetime,
         *,
         action: str,
-    ) -> tuple[str, str, int, dict[str, Any]]:
-        """Return the authoritative envelope for a lifecycle transition or fail.
+    ) -> tuple[str, str, dict[str, Any]]:
+        """Shared exact-authority gate binding holder and canonical envelope identity.
 
-        A transition is only legal for the holder/attempt/fence that currently
-        owns the node under an unexpired, un-revoked, non-terminal lease. This is
-        the shared fail-closed gate for renew/revoke/complete (contract §9).
+        Returns ``(graph_id, node_id, authority)`` for the current fence when the
+        supplied envelope IS the byte-identical authoritative sealed envelope
+        (correct fence, attempt, holder, and canonical identity). Fails closed
+        otherwise. This is the common identity gate for renew/revoke/complete
+        (contract §9); it does NOT check time, revocation, or terminal state —
+        those are decided per action.
         """
 
         graph_id = str(envelope.get("graph_id"))
@@ -454,17 +566,37 @@ class Phase2AuthorityStore:
             "lease"
         ].get("holder"):
             raise AuthorityError(f"lease holder cannot {action}")
+        if _canonical_json(dict(envelope)) != _canonical_json(authoritative):
+            raise AuthorityError(f"non-authoritative envelope cannot {action}")
+        return graph_id, node_id, authority
+
+    def _load_live_authority(
+        self,
+        conn: sqlite3.Connection,
+        envelope: Mapping[str, Any],
+        current: datetime,
+        *,
+        action: str,
+    ) -> tuple[str, str, int, dict[str, Any]]:
+        """Return the authoritative envelope for a lifecycle transition or fail.
+
+        A transition is only legal for the holder/attempt/fence that currently
+        owns the node under an unexpired, un-revoked, non-terminal lease. This is
+        the shared fail-closed gate for renew/complete (contract §9). The
+        ``authority`` mapping derives the effective expiry externally from the
+        grant plus the latest valid renewal; the envelope itself is immutable.
+        """
+
+        graph_id, node_id, authority = self._authority_gate(conn, envelope, action=action)
         if authority["completed"]:
             raise AuthorityError("node already completed")
         if authority["revoked"]:
             raise AuthorityError(f"revoked lease cannot {action}")
-        if _canonical_json(dict(envelope)) != _canonical_json(authoritative):
-            raise AuthorityError(f"non-authoritative envelope cannot {action}")
-        if current >= self._lease_expiry(authoritative):
+        if current >= authority["effective_expires"]:
             raise AuthorityError(f"expired lease cannot {action}")
-        if current >= _parse_time(authoritative["deadline_utc"]):
+        if current >= _parse_time(authority["envelope"]["deadline_utc"]):
             raise AuthorityError(f"expired deadline cannot {action}")
-        return graph_id, node_id, authority["fence"], authoritative
+        return graph_id, node_id, authority["fence"], authority["envelope"]
 
     def renew_node(
         self,
@@ -473,12 +605,17 @@ class Phase2AuthorityStore:
         ttl_s: float,
         now: datetime | None = None,
     ) -> dict[str, Any]:
-        """Atomically extend the active lease without changing node authority.
+        """Atomically extend the active lease via external bounded metadata.
 
-        Renewal keeps ``graph_id``/``node_id``/``attempt_id``/``fence`` and the
-        lease holder fixed; only ``granted_utc``/``ttl_s`` advance. It refuses to
-        revive an expired, revoked, or terminal lease so a dead node can never be
-        resurrected in place (contract §9).
+        The sealed ``LEASE_GRANTED`` envelope is immutable forever; it is never
+        re-sealed, rewritten, or stored inside the renewal event. ``ttl_s`` is a
+        duration measured from the renewal moment, and the new effective expiry
+        (``now + ttl_s``) must not reach or exceed the node deadline. Renewal is
+        bound to graph/node/holder/attempt/fence and must occur strictly before
+        the current effective expiry. It never revives an expired, revoked, or
+        terminal lease (contract §9). Returns a current-authority record whose
+        ``envelope`` is the original sealed envelope; effective expiry derives
+        from grant plus this latest valid renewal.
         """
 
         renewed_at = _utc(now)
@@ -489,18 +626,31 @@ class Phase2AuthorityStore:
             conn = self._connect()
             try:
                 conn.execute("BEGIN IMMEDIATE")
-                graph_id, node_id, fence, authoritative = self._load_live_authority(
-                    conn, envelope, renewed_at, action="renew"
+                # Identity gate first (graph/node/holder/attempt/fence/canonical
+                # envelope), without the time checks so the deadline cap and the
+                # "never revive" rules are evaluated explicitly and in order.
+                graph_id, node_id, authority = self._authority_gate(
+                    conn, envelope, action="renew"
                 )
-                renewed = json.loads(_canonical_json(authoritative))
-                renewed["lease"] = {
-                    **renewed["lease"],
-                    "granted_utc": _iso(renewed_at),
-                    "ttl_s": ttl,
-                }
-                errors = validate_sealed_envelope(renewed)
-                if errors:
-                    raise AuthorityError("invalid renewed envelope: " + ", ".join(errors))
+                if authority["completed"]:
+                    raise AuthorityError("node already completed")
+                if authority["revoked"]:
+                    raise AuthorityError("revoked lease cannot renew")
+                authoritative = authority["envelope"]
+                deadline = _parse_time(authoritative["deadline_utc"])
+                new_expires = renewed_at + timedelta(seconds=ttl)
+                # The new effective expiry must not reach or exceed the deadline.
+                if new_expires >= deadline:
+                    raise AuthorityError(
+                        "renewal effective expiry must not exceed the node deadline"
+                    )
+                # Renewal must occur strictly before the current effective expiry
+                # (now >= expires is already expired) and before the deadline.
+                if renewed_at >= authority["effective_expires"]:
+                    raise AuthorityError("expired lease cannot renew")
+                if renewed_at >= deadline:
+                    raise AuthorityError("expired deadline cannot renew")
+                fence = authority["fence"]
                 self._append_event(
                     conn,
                     kind="LEASE_RENEWED",
@@ -508,11 +658,25 @@ class Phase2AuthorityStore:
                     node_id=node_id,
                     attempt_id=str(envelope["attempt_id"]),
                     fence=fence,
-                    payload={"envelope": renewed},
+                    payload={
+                        "holder": authoritative["lease"]["holder"],
+                        "prior_expires_utc": _iso(authority["effective_expires"]),
+                        "new_expires_utc": _iso(new_expires),
+                    },
                     now=renewed_at,
                 )
                 conn.execute("COMMIT")
-                return renewed
+                return {
+                    "graph_id": graph_id,
+                    "node_id": node_id,
+                    "attempt_id": str(envelope["attempt_id"]),
+                    "fence": fence,
+                    "holder": authoritative["lease"]["holder"],
+                    "envelope": authoritative,
+                    "prior_expires_utc": _iso(authority["effective_expires"]),
+                    "new_expires_utc": _iso(new_expires),
+                    "effective_expires_utc": _iso(new_expires),
+                }
             except Exception:
                 try:
                     conn.execute("ROLLBACK")
@@ -527,9 +691,14 @@ class Phase2AuthorityStore:
     ) -> dict[str, Any]:
         """Cancel the current lease so the node can be immediately regranted.
 
-        After revocation the old envelope validates ``lease_revoked``/``stale_fence``
-        and can never authorize execution; a fresh ``grant_node`` issues the next
-        monotonic fence without waiting for the original TTL to elapse.
+        Revocation uses the shared exact authority gate: the supplied envelope
+        must be the byte-identical authoritative sealed envelope (current fence,
+        attempt, holder, and canonical identity) — a forged holder or tampered
+        envelope fails closed. Exact-expiry revoke is legal (an unexpired lease
+        may be cancelled at any live moment). After revocation the old envelope
+        validates ``lease_revoked``/``stale_fence`` and can never authorize
+        execution; a fresh ``grant_node`` issues the next monotonic fence
+        without waiting for the original TTL to elapse.
         """
 
         revoked_at = _utc(now)
@@ -537,18 +706,14 @@ class Phase2AuthorityStore:
             conn = self._connect()
             try:
                 conn.execute("BEGIN IMMEDIATE")
-                graph_id = str(envelope.get("graph_id"))
-                node_id = str(envelope.get("node_id"))
-                authority = self._node_authority(conn, graph_id, node_id)
-                if authority is None or envelope.get("fence") != authority["fence"]:
-                    raise AuthorityError("stale fence cannot revoke")
+                graph_id, node_id, authority = self._authority_gate(
+                    conn, envelope, action="revoke"
+                )
                 if authority["completed"]:
                     raise AuthorityError("node already completed")
                 if authority["revoked"]:
                     raise AuthorityError("lease already revoked")
                 authoritative = authority["envelope"]
-                if authoritative.get("attempt_id") != envelope.get("attempt_id"):
-                    raise AuthorityError("stale attempt cannot revoke")
                 self._append_event(
                     conn,
                     kind="LEASE_REVOKED",
@@ -576,41 +741,54 @@ class Phase2AuthorityStore:
                 conn.close()
 
     def complete_node(
-        self, envelope: Mapping[str, Any], *, now: datetime | None = None
+        self,
+        envelope: Mapping[str, Any],
+        *,
+        result_hash: str,
+        now: datetime | None = None,
     ) -> dict[str, Any]:
         """Accept the current unexpired holder/attempt/fence exactly once.
 
-        Completion is the sole authoritative terminal transition. A stale,
-        expired, revoked, superseded, or already-completed envelope is refused,
-        so duplicate or racing completions cannot both become authoritative
-        (contract §5, §9).
+        Result acceptance requires the caller's ``result_hash`` (a SHA-256 over
+        the canonical result; raw results are never stored). Acceptance is the
+        sole authoritative terminal transition: it folds identity, expiry,
+        deadline, revocation, and terminal state in one immediate transaction
+        and appends exactly one ``RESULT_ACCEPTED`` event carrying the hash.
+
+        A redelivery of the SAME accepted ``result_hash`` is an idempotent
+        lookup returning the prior acceptance with no new event. A stale,
+        expired, revoked, superseded, conflicting-duplicate, or forged
+        completion appends exactly one typed ``RESULT_REJECTED`` event (bounded
+        reason + result_hash) in the same decision transaction, then raises
+        ``ResultRejection``. At most one accepted result per graph/node is
+        backstopped by a partial unique index (contract §5, §9).
         """
 
+        result_hash = _valid_sha256(result_hash, "result_hash")
         completed_at = _utc(now)
         with _DB_LOCK:
             conn = self._connect()
             try:
                 conn.execute("BEGIN IMMEDIATE")
-                graph_id, node_id, fence, authoritative = self._load_live_authority(
-                    conn, envelope, completed_at, action="complete"
-                )
-                self._append_event(
-                    conn,
-                    kind="NODE_COMPLETED",
-                    graph_id=graph_id,
-                    node_id=node_id,
-                    attempt_id=str(authoritative["attempt_id"]),
-                    fence=fence,
-                    payload={"holder": authoritative["lease"]["holder"]},
-                    now=completed_at,
-                )
+                graph_id = str(envelope.get("graph_id"))
+                node_id = str(envelope.get("node_id"))
+                try:
+                    record = self._accept_result(
+                        conn, envelope, result_hash, completed_at
+                    )
+                except _Reject as reject:
+                    self._append_rejection(
+                        conn,
+                        envelope,
+                        reject.reason,
+                        result_hash,
+                        completed_at,
+                        fence_hint=reject.fence_hint,
+                    )
+                    conn.execute("COMMIT")
+                    raise ResultRejection(reject.reason, result_hash=result_hash) from None
                 conn.execute("COMMIT")
-                return {
-                    "graph_id": graph_id,
-                    "node_id": node_id,
-                    "attempt_id": str(authoritative["attempt_id"]),
-                    "fence": fence,
-                }
+                return record
             except Exception:
                 try:
                     conn.execute("ROLLBACK")
@@ -620,11 +798,146 @@ class Phase2AuthorityStore:
             finally:
                 conn.close()
 
+    def _accept_result(
+        self,
+        conn: sqlite3.Connection,
+        envelope: Mapping[str, Any],
+        result_hash: str,
+        current: datetime,
+    ) -> dict[str, Any]:
+        """Fold the acceptance decision; append RESULT_ACCEPTED or raise _Reject.
+
+        Identity (graph/node/holder/attempt/fence/canonical envelope) is folded
+        in deterministic order so a forgery that is also stale reports the more
+        fundamental staleness reason first.
+        """
+
+        graph_id = str(envelope.get("graph_id"))
+        node_id = str(envelope.get("node_id"))
+        self._load_plan_node(conn, graph_id, node_id)  # unknown node -> AuthorityError
+        authority = self._node_authority(conn, graph_id, node_id)
+
+        def reject(reason: str, *, fence_hint: int | None = None) -> None:
+            raise _Reject(reason, fence_hint=fence_hint)
+
+        if authority is None:
+            reject("no_grant")
+        assert authority is not None
+        if envelope.get("fence") != authority["fence"]:
+            reject("stale_fence", fence_hint=authority["fence"])
+        authoritative = authority["envelope"]
+        if authoritative.get("attempt_id") != envelope.get("attempt_id"):
+            reject("stale_attempt", fence_hint=authority["fence"])
+        env_lease = envelope.get("lease")
+        if not isinstance(env_lease, Mapping) or env_lease.get("holder") != authoritative[
+            "lease"
+        ].get("holder"):
+            reject("holder_mismatch", fence_hint=authority["fence"])
+        if _canonical_json(dict(envelope)) != _canonical_json(authoritative):
+            reject("envelope_not_authoritative", fence_hint=authority["fence"])
+        if authority["completed"]:
+            if authority["accepted_result_hash"] == result_hash:
+                # Idempotent redelivery of the same accepted result.
+                return {
+                    "graph_id": graph_id,
+                    "node_id": node_id,
+                    "attempt_id": str(authoritative["attempt_id"]),
+                    "fence": authority["fence"],
+                    "holder": authoritative["lease"]["holder"],
+                    "result_hash": result_hash,
+                    "idempotent": True,
+                }
+            reject("node_completed", fence_hint=authority["fence"])
+        if authority["revoked"]:
+            reject("lease_revoked", fence_hint=authority["fence"])
+        if current >= authority["effective_expires"]:
+            reject("lease_expired", fence_hint=authority["fence"])
+        if current >= _parse_time(authoritative["deadline_utc"]):
+            reject("deadline_expired", fence_hint=authority["fence"])
+
+        self._append_event(
+            conn,
+            kind="RESULT_ACCEPTED",
+            graph_id=graph_id,
+            node_id=node_id,
+            attempt_id=str(authoritative["attempt_id"]),
+            fence=authority["fence"],
+            payload={
+                "holder": authoritative["lease"]["holder"],
+                "result_hash": result_hash,
+            },
+            now=current,
+        )
+        return {
+            "graph_id": graph_id,
+            "node_id": node_id,
+            "attempt_id": str(authoritative["attempt_id"]),
+            "fence": authority["fence"],
+            "holder": authoritative["lease"]["holder"],
+            "result_hash": result_hash,
+        }
+
+    def _append_rejection(
+        self,
+        conn: sqlite3.Connection,
+        envelope: Mapping[str, Any],
+        reason: str,
+        result_hash: str | None,
+        now: datetime,
+        *,
+        fence_hint: int | None = None,
+    ) -> None:
+        """Append one typed RESULT_REJECTED audit event in the decision transaction.
+
+        The event is stamped with the caller's claimed fence from the envelope
+        (not the current live fence), so the audit trail faithfully records which
+        fence the rejected caller claimed to hold.
+        """
+
+        # Use the presenting envelope's fence value so the audit record faithfully
+        # captures what the caller claimed. fence_hint is the authoritative
+        # current fence and is recorded in the payload for reconciliation.
+        event_fence = envelope.get("fence")
+        self._append_event(
+            conn,
+            kind="RESULT_REJECTED",
+            graph_id=str(envelope.get("graph_id")),
+            node_id=str(envelope.get("node_id")),
+            attempt_id=str(envelope.get("attempt_id")) if envelope.get("attempt_id") else None,
+            fence=event_fence,
+            payload={"reason": reason, "result_hash": result_hash, "current_fence": fence_hint},
+            now=now,
+        )
+
     def current_fence(self, graph_id: str, node_id: str) -> int | None:
         conn = self._connect()
         try:
             row = self._latest_grant(conn, graph_id, node_id)
             return int(row["fence"]) if row is not None else None
+        finally:
+            conn.close()
+
+    def current_authority(self, graph_id: str, node_id: str) -> dict[str, Any] | None:
+        """Return the folded current authority view for a node, or ``None``.
+
+        The ``envelope`` is the immutable sealed grant envelope. Effective
+        expiry is derived externally from grant plus the latest valid renewal.
+        """
+
+        conn = self._connect()
+        try:
+            authority = self._node_authority(conn, graph_id, node_id)
+            if authority is None:
+                return None
+            return {
+                "fence": authority["fence"],
+                "envelope": authority["envelope"],
+                "granted_expires_utc": _iso(authority["granted_expires"]),
+                "effective_expires_utc": _iso(authority["effective_expires"]),
+                "revoked": authority["revoked"],
+                "completed": authority["completed"],
+                "accepted_result_hash": authority["accepted_result_hash"],
+            }
         finally:
             conn.close()
 
@@ -657,19 +970,29 @@ class Phase2AuthorityStore:
                     errors.append("lease_revoked")
                 if authority["completed"]:
                     errors.append("node_terminal")
+                # Effective expiry derives from grant + latest valid renewal, so
+                # the original sealed envelope stays authoritative through a
+                # renewal-extended lease.
+                if current >= authority["effective_expires"]:
+                    errors.append("lease_expired")
+                if current >= _parse_time(authority["envelope"]["deadline_utc"]):
+                    errors.append("deadline_expired")
+            else:
+                try:
+                    granted = _parse_time(envelope.get("lease", {}).get("granted_utc"))
+                    expires = granted + timedelta(
+                        seconds=float(envelope.get("lease", {}).get("ttl_s"))
+                    )
+                    if current >= expires:
+                        errors.append("lease_expired")
+                    if current >= _parse_time(envelope.get("deadline_utc")):
+                        errors.append("deadline_expired")
+                except (AuthorityError, TypeError, ValueError):
+                    errors.append("lease_or_deadline_invalid")
             if envelope.get("planner_hash") != plan["planner_hash"]:
                 errors.append("planner_hash")
             if envelope.get("policy_hash") != plan["policy_hash"]:
                 errors.append("policy_hash")
-            try:
-                granted = _parse_time(envelope.get("lease", {}).get("granted_utc"))
-                expires = granted + timedelta(seconds=float(envelope.get("lease", {}).get("ttl_s")))
-                if current >= expires:
-                    errors.append("lease_expired")
-                if current >= _parse_time(envelope.get("deadline_utc")):
-                    errors.append("deadline_expired")
-            except (AuthorityError, TypeError, ValueError):
-                errors.append("lease_or_deadline_invalid")
             return sorted(set(errors))
         finally:
             conn.close()
@@ -763,7 +1086,7 @@ class Phase2AuthorityStore:
                 latest_envelope = authority["envelope"]
                 if latest_envelope.get("attempt_id") != envelope.get("attempt_id"):
                     raise AuthorityError("stale attempt cannot reserve budget")
-                if current >= self._lease_expiry(latest_envelope):
+                if current >= authority["effective_expires"]:
                     raise AuthorityError("expired lease cannot reserve budget")
                 state = self._budget_state(conn, graph_id, node_id, int(envelope["fence"]))
                 if state["cost_unknown"]:
@@ -865,9 +1188,18 @@ class Phase2AuthorityStore:
     def recover(self, *, now: datetime | None = None) -> dict[str, int]:
         """Verify the durable chain and poison expired, unreconciled reservations.
 
+        Startup recovery verifies every lifecycle event's hash chain, then folds
+        grant, renewal, revocation, terminal acceptance, and rejection events to
+        derive current lease/terminal state. The sealed grant envelope stays
+        immutable; effective expiry derives externally from the grant plus the
+        latest valid renewal. A revoked or terminally accepted lease is dead;
+        a renewed lease's expiry is honored. Any malformed payload or hash-chain
+        tamper fails closed. Monotonic fences are preserved (grants are only
+        ever read, never rewritten).
+
         A crash after reservation but before provider accounting leaves spend
         unknowable. Recovery reconciles that reservation with ``actual_usd=None``
-        once its owning lease expires, which preserves fail-closed budget behavior.
+        once its owning lease is dead, which preserves fail-closed budget behavior.
         """
 
         current = _utc(now)
@@ -911,12 +1243,14 @@ class Phase2AuthorityStore:
                         grants[key] = payload
                     elif row["kind"] == "LEASE_RENEWED":
                         renewals[key] = payload
-                    elif row["kind"] in ("LEASE_REVOKED", "NODE_COMPLETED"):
+                    elif row["kind"] in ("LEASE_REVOKED",) + _ACCEPTED_KINDS:
+                        # Revocation and terminal acceptance close the lease.
                         dead_leases.add(key)
                     elif row["kind"] == "BUDGET_RESERVED":
                         reservations[row["event_id"]] = row
                     elif row["kind"] == "BUDGET_RECONCILED":
                         reconciled.add(str(payload.get("reservation_id")))
+                    # RESULT_REJECTED is audit-only; it never closes a lease.
 
                 for reservation_id, reservation in reservations.items():
                     if reservation_id in reconciled:
@@ -929,14 +1263,21 @@ class Phase2AuthorityStore:
                     grant = grants.get(key)
                     if grant is None:
                         raise AuthorityError("orphaned reservation has no authoritative lease")
-                    # A revoked or completed lease is dead now; renewal extends the
-                    # authoritative expiry. Reconcile only once the live lease is dead.
+                    # A revoked or terminally accepted lease is dead now; renewal
+                    # extends the effective expiry derived from the immutable
+                    # grant envelope. Reconcile only once the live lease is dead.
                     if key not in dead_leases:
                         try:
-                            envelope = renewals.get(key, grant)["envelope"]
+                            envelope = grant["envelope"]
                             lease = envelope["lease"]
-                            expires = _parse_time(lease["granted_utc"]) + timedelta(
+                            base_expires = _parse_time(lease["granted_utc"]) + timedelta(
                                 seconds=float(lease["ttl_s"])
+                            )
+                            renewal = renewals.get(key)
+                            expires = (
+                                _parse_time(renewal["new_expires_utc"])
+                                if renewal is not None
+                                else base_expires
                             )
                         except (KeyError, TypeError, ValueError, AuthorityError) as exc:
                             raise AuthorityError("orphaned reservation lease is invalid") from exc
@@ -988,9 +1329,19 @@ class Phase2AuthorityStore:
             rows = conn.execute(
                 "SELECT * FROM authority_events WHERE graph_id = ? ORDER BY id", (graph_id,)
             )
-            return [dict(row) for row in rows]
+            result = []
+            for row in rows:
+                record = dict(row)
+                # Deserialize payload_json -> payload so callers can inspect
+                # structured event payloads without an extra json.loads().
+                try:
+                    record["payload"] = json.loads(record["payload_json"])
+                except (TypeError, ValueError, KeyError):
+                    record["payload"] = None
+                result.append(record)
+            return result
         finally:
             conn.close()
 
 
-__all__ = ["AuthorityError", "Phase2AuthorityStore", "default_db_path"]
+__all__ = ["AuthorityError", "Phase2AuthorityStore", "ResultRejection", "default_db_path"]

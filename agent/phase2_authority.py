@@ -9,13 +9,14 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import sqlite3
 import threading
 import uuid
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Iterator, Mapping
+from typing import Any, Iterator, Mapping, NamedTuple
 
 from agent.phase2_enforcement import bind_sealed_envelope, validate_sealed_envelope
 from hermes_constants import get_hermes_home
@@ -24,6 +25,10 @@ _DB_LOCK = threading.Lock()
 _HASH_KEYS = ("idempotency_key", "input_hash")
 _ALLOWED_SURFACES = {"direct_model", "combo", "acp_worker", "a2a", "cloud", "local_tool"}
 _SHA256_RE_LEN = 64
+# Bounded audit metadata for a rejected caller's malformed fence claim.
+_FENCE_REPR_MAX = 64
+# Bounded per-invariant sample size in a migration diagnostic.
+_MIGRATION_SAMPLE_MAX = 5
 
 # Lifecycle event kinds. LEASE_GRANTED carries the sole sealed envelope, which
 # stays immutable forever. LEASE_RENEWED carries bounded external metadata only
@@ -42,8 +47,127 @@ _EVENT_KINDS = (
 _ACCEPTED_KINDS = ("RESULT_ACCEPTED", "NODE_COMPLETED")
 
 
+class _IntegrityIndex(NamedTuple):
+    """A partial unique index that backstops one authority invariant.
+
+    ``scan_sql`` groups the rows the index would collapse, using exactly the
+    index's own NULL semantics (a unique index treats every NULL as distinct,
+    so rows with a NULL indexed column can never conflict and are excluded).
+    Running the scan before ``CREATE UNIQUE INDEX`` turns a raw
+    ``sqlite3.IntegrityError`` on a legacy database into a typed, actionable
+    migration decision.
+    """
+
+    name: str
+    create_sql: str
+    invariant: str
+    scan_sql: str
+    remediation: str
+
+
+_INTEGRITY_INDEXES: tuple[_IntegrityIndex, ...] = (
+    _IntegrityIndex(
+        name="one_accepted_result_per_node",
+        create_sql=(
+            "CREATE UNIQUE INDEX one_accepted_result_per_node "
+            "ON authority_events(graph_id, node_id) WHERE kind = 'RESULT_ACCEPTED'"
+        ),
+        invariant="duplicate_accepted_result",
+        scan_sql=(
+            "SELECT graph_id || '/' || node_id AS violation_key, COUNT(*) AS events "
+            "FROM authority_events "
+            "WHERE kind = 'RESULT_ACCEPTED' AND node_id IS NOT NULL "
+            "GROUP BY graph_id, node_id HAVING COUNT(*) > 1 "
+            "ORDER BY graph_id, node_id"
+        ),
+        remediation=(
+            "more than one RESULT_ACCEPTED exists for a node; exactly one result "
+            "may be authoritative, so the correct acceptance must be chosen by an "
+            "operator before this store can serve authority"
+        ),
+    ),
+    _IntegrityIndex(
+        name="one_terminal_result_per_node",
+        create_sql=(
+            "CREATE UNIQUE INDEX one_terminal_result_per_node "
+            "ON authority_events(graph_id, node_id) "
+            "WHERE kind IN ('RESULT_ACCEPTED', 'NODE_COMPLETED')"
+        ),
+        invariant="duplicate_terminal_result",
+        scan_sql=(
+            "SELECT graph_id || '/' || node_id AS violation_key, COUNT(*) AS events "
+            "FROM authority_events "
+            "WHERE kind IN ('RESULT_ACCEPTED', 'NODE_COMPLETED') AND node_id IS NOT NULL "
+            "GROUP BY graph_id, node_id HAVING COUNT(*) > 1 "
+            "ORDER BY graph_id, node_id"
+        ),
+        remediation=(
+            "a node carries more than one terminal completion row (legacy stores "
+            "permitted regrant after completion, so a node could be completed once "
+            "per fence); the authoritative terminal event must be chosen by an "
+            "operator before this store can serve authority"
+        ),
+    ),
+    _IntegrityIndex(
+        name="one_grant_per_attempt",
+        create_sql=(
+            "CREATE UNIQUE INDEX one_grant_per_attempt "
+            "ON authority_events(attempt_id) WHERE kind = 'LEASE_GRANTED'"
+        ),
+        invariant="duplicate_grant_attempt_id",
+        scan_sql=(
+            "SELECT attempt_id AS violation_key, COUNT(*) AS events "
+            "FROM authority_events "
+            "WHERE kind = 'LEASE_GRANTED' AND attempt_id IS NOT NULL "
+            "GROUP BY attempt_id HAVING COUNT(*) > 1 "
+            "ORDER BY attempt_id"
+        ),
+        remediation=(
+            "an attempt_id was granted more than once (legacy stores did not bind "
+            "attempt_id globally, so the same id could be granted on another node "
+            "or graph); attempt identity cannot be reconstructed automatically and "
+            "must be resolved by an operator"
+        ),
+    ),
+)
+
+
 class AuthorityError(RuntimeError):
     """A requested authority transition is invalid or unavailable."""
+
+
+class AuthorityMigrationRequired(AuthorityError):
+    """A durable store predates an integrity invariant its data now violates.
+
+    Raised instead of creating a unique index that existing authoritative rows
+    would violate. Authoritative events are never deleted or rewritten to make
+    an index fit, so the store stays readable for inspection
+    (:meth:`Phase2AuthorityStore.migration_report`,
+    :meth:`Phase2AuthorityStore.read_events`) while every authority-serving path
+    fails closed with this typed, actionable error.
+    """
+
+    def __init__(self, violations: list[dict[str, Any]], db_path: Path | str) -> None:
+        self.violations = tuple(violations)
+        self.db_path = str(db_path)
+        summary = "; ".join(
+            "{invariant}: {groups} violating group(s), sample {sample} ({remediation})".format(
+                invariant=violation["invariant"],
+                groups=violation["violating_groups"],
+                sample=[
+                    f"{item['key']} x{item['events']}" for item in violation["sample"]
+                ],
+                remediation=violation["remediation"],
+            )
+            for violation in self.violations
+        )
+        super().__init__(
+            f"authority store {self.db_path} requires explicit migration before use: "
+            f"{summary}. Authoritative events are never auto-deleted or rewritten; "
+            "inspect with Phase2AuthorityStore(db_path).migration_report() and "
+            "read_events(graph_id), then quarantine this database and re-seal, or "
+            "resolve the listed rows out of band."
+        )
 
 
 class ResultRejection(AuthorityError):
@@ -58,6 +182,34 @@ class ResultRejection(AuthorityError):
         super().__init__(f"result rejected: {reason}")
         self.reason = reason
         self.result_hash = result_hash
+
+
+class MalformedEnvelopeFence(ResultRejection):
+    """A completion presented a fence that is not an integer.
+
+    Contract v2 requires ``fence`` to be a positive ``int``. A caller-supplied
+    ``"1"``, ``1.0``, ``True``, ``[1]``, or ``{}`` is not a fence: it can neither
+    be compared against the authoritative fence nor bound to the INTEGER column
+    without SQLite type affinity silently rewriting it into a value that no
+    longer matches the integrity hash computed over it. Such a completion is
+    rejected fail-closed, and the claim survives only as bounded audit metadata
+    on the ``RESULT_REJECTED`` event (whose ``fence`` column is ``NULL``).
+
+    Subclasses :class:`ResultRejection` so existing fail-closed handlers keep
+    working unchanged.
+    """
+
+    def __init__(
+        self,
+        reason: str,
+        *,
+        result_hash: str | None = None,
+        claimed_fence_type: str | None = None,
+        claimed_fence_repr: str | None = None,
+    ) -> None:
+        super().__init__(reason, result_hash=result_hash)
+        self.claimed_fence_type = claimed_fence_type
+        self.claimed_fence_repr = claimed_fence_repr
 
 
 class _Reject(Exception):
@@ -105,7 +257,69 @@ def _parse_time(value: Any) -> datetime:
 def _nonnegative_number(value: Any, field: str) -> float:
     if isinstance(value, bool) or not isinstance(value, (int, float)) or value < 0:
         raise AuthorityError(f"{field} must be a non-negative number")
+    # NaN/Infinity are neither auditable (they are not valid JSON) nor safe to
+    # compare: every ``nan > limit`` budget check is False, so a NaN would slip
+    # past the ceiling instead of failing closed.
+    if not math.isfinite(value):
+        raise AuthorityError(f"{field} must be a finite number")
     return float(value)
+
+
+def _bounded_repr(value: Any) -> str:
+    """Render an untrusted value as bounded, JSON-safe audit text."""
+
+    try:
+        text = repr(value)
+    except Exception:  # pragma: no cover - defensive: hostile __repr__
+        return f"<unrepresentable {type(value).__name__}>"
+    if len(text) > _FENCE_REPR_MAX:
+        text = text[: _FENCE_REPR_MAX - 3] + "..."
+    return text
+
+
+def _normalize_claimed_fence(value: Any) -> tuple[int | None, dict[str, Any]]:
+    """Normalize a caller-supplied fence to a column- and hash-stable value.
+
+    Returns ``(fence, audit)``. ``fence`` is both bound to the INTEGER ``fence``
+    column and folded into the event hash, so it must be exactly the type SQLite
+    hands back on read: a non-``bool`` ``int``, or ``None``. Every other value is
+    malformed and normalizes to ``None``:
+
+    * ``"1"``, ``1.0`` and ``True`` are silently rewritten to the integer ``1``
+      by INTEGER column affinity, so the stored row would no longer reproduce
+      the hash computed over the original Python value and the append-only chain
+      would fail verification forever;
+    * ``[1]`` and ``{}`` cannot bind to a SQLite parameter at all and would
+      abort the write with an untyped ``sqlite3.ProgrammingError``, losing the
+      audit record entirely.
+
+    The malformed claim survives as bounded audit metadata instead.
+    """
+
+    if value is None:
+        return None, {"claimed_fence": None, "claimed_fence_malformed": False}
+    if isinstance(value, int) and not isinstance(value, bool):
+        return value, {"claimed_fence": value, "claimed_fence_malformed": False}
+    return None, {
+        "claimed_fence": None,
+        "claimed_fence_malformed": True,
+        "claimed_fence_type": type(value).__name__,
+        "claimed_fence_repr": _bounded_repr(value),
+    }
+
+
+def _canonical_identity(value: Any) -> str | None:
+    """Canonical JSON of an untrusted envelope, or ``None`` if unrepresentable.
+
+    A caller-supplied envelope that cannot be canonicalized can never equal the
+    authoritative envelope, so ``None`` is a fail-closed identity mismatch
+    rather than an untyped ``TypeError`` out of the identity gate.
+    """
+
+    try:
+        return _canonical_json(dict(value))
+    except (TypeError, ValueError):
+        return None
 
 
 def _valid_sha256(value: Any, field: str) -> str:
@@ -131,14 +345,30 @@ class Phase2AuthorityStore:
     def _connect(self) -> sqlite3.Connection:
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         conn = sqlite3.connect(self.db_path, isolation_level=None, timeout=5.0)
-        conn.execute("PRAGMA journal_mode=WAL")
-        conn.execute("PRAGMA busy_timeout=5000")
-        conn.row_factory = sqlite3.Row
-        self._ensure_schema(conn)
+        try:
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("PRAGMA busy_timeout=5000")
+            conn.row_factory = sqlite3.Row
+            self._ensure_schema(conn)
+        except Exception:
+            # A store that cannot be brought up to the current schema must not
+            # leak its connection on every retry.
+            conn.close()
+            raise
         return conn
 
+    def _ensure_schema(self, conn: sqlite3.Connection) -> None:
+        self._ensure_base_schema(conn)
+        self._ensure_integrity_indexes(conn, self.db_path)
+
     @staticmethod
-    def _ensure_schema(conn: sqlite3.Connection) -> None:
+    def _ensure_base_schema(conn: sqlite3.Connection) -> None:
+        """Create the tables and append-only triggers.
+
+        Every statement here is unconditionally safe against existing data: no
+        object created can conflict with rows a legacy store already holds.
+        """
+
         conn.executescript(
             """
             CREATE TABLE IF NOT EXISTS sealed_plans (
@@ -193,17 +423,93 @@ class Phase2AuthorityStore:
             BEFORE DELETE ON authority_events BEGIN
                 SELECT RAISE(ABORT, 'authority_events is append-only');
             END;
-            CREATE UNIQUE INDEX IF NOT EXISTS one_accepted_result_per_node
-            ON authority_events(graph_id, node_id)
-            WHERE kind = 'RESULT_ACCEPTED';
-            CREATE UNIQUE INDEX IF NOT EXISTS one_terminal_result_per_node
-            ON authority_events(graph_id, node_id)
-            WHERE kind IN ('RESULT_ACCEPTED', 'NODE_COMPLETED');
-            CREATE UNIQUE INDEX IF NOT EXISTS one_grant_per_attempt
-            ON authority_events(attempt_id)
-            WHERE kind = 'LEASE_GRANTED';
             """
         )
+
+    @staticmethod
+    def _missing_integrity_indexes(conn: sqlite3.Connection) -> list[_IntegrityIndex]:
+        present = {
+            row[0]
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'index'"
+            ).fetchall()
+        }
+        return [index for index in _INTEGRITY_INDEXES if index.name not in present]
+
+    @staticmethod
+    def _scan_integrity_violations(
+        conn: sqlite3.Connection, indexes: list[_IntegrityIndex]
+    ) -> list[dict[str, Any]]:
+        """Report, deterministically, which rows would violate each index.
+
+        Read-only: this never deletes, rewrites, or reorders an authoritative
+        event. Each report is bounded — an exact violating-group count plus a
+        capped, ordered sample — so a large legacy store cannot produce an
+        unbounded error message.
+        """
+
+        violations: list[dict[str, Any]] = []
+        for index in indexes:
+            groups = conn.execute(
+                f"SELECT COUNT(*) FROM ({index.scan_sql})"  # noqa: S608 - fixed literal
+            ).fetchone()[0]
+            if not groups:
+                continue
+            sample = conn.execute(
+                f"{index.scan_sql} LIMIT ?",  # noqa: S608 - fixed literal
+                (_MIGRATION_SAMPLE_MAX,),
+            ).fetchall()
+            violations.append(
+                {
+                    "invariant": index.invariant,
+                    "index": index.name,
+                    "violating_groups": int(groups),
+                    "sample": [
+                        {"key": row[0], "events": int(row[1])} for row in sample
+                    ],
+                    "remediation": index.remediation,
+                }
+            )
+        return violations
+
+    @classmethod
+    def _ensure_integrity_indexes(
+        cls, conn: sqlite3.Connection, db_path: Path | str
+    ) -> None:
+        """Create the backstop unique indexes, or fail closed with a typed error.
+
+        ``CREATE UNIQUE INDEX`` against a legacy store whose rows already violate
+        the invariant raises a raw ``sqlite3.IntegrityError`` from inside
+        ``_connect``, which would take out every authority-serving call — connect,
+        recover, validate — with an untyped, unactionable error. Instead the
+        offending rows are scanned first, under the same write lock that would
+        create the index, and a typed :class:`AuthorityMigrationRequired` is
+        raised describing exactly what must be resolved. Authoritative events are
+        never deleted or rewritten to make an index fit.
+        """
+
+        if not cls._missing_integrity_indexes(conn):
+            return  # Fast path: nothing to migrate, no write lock, no scan.
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            # Re-check under the write lock: a concurrent process may have
+            # migrated this store between the check above and the lock.
+            missing = cls._missing_integrity_indexes(conn)
+            violations = cls._scan_integrity_violations(conn, missing) if missing else []
+            if violations:
+                conn.execute("ROLLBACK")
+                raise AuthorityMigrationRequired(violations, db_path)
+            for index in missing:
+                conn.execute(index.create_sql)
+            conn.execute("COMMIT")
+        except AuthorityMigrationRequired:
+            raise
+        except Exception:
+            try:
+                conn.execute("ROLLBACK")
+            except Exception:
+                pass
+            raise
 
     @staticmethod
     def _append_event(
@@ -218,6 +524,25 @@ class Phase2AuthorityStore:
         now: datetime,
         event_id: str | None = None,
     ) -> str:
+        # Integrity invariant: every value bound to a column must be exactly the
+        # type SQLite hands back on read, because the hash is computed over the
+        # in-memory value and re-verified against the stored one. Column affinity
+        # silently rewrites mismatched types ("1", 1.0 and True all land in an
+        # INTEGER column as 1; an int lands in a TEXT column as "1"), which would
+        # make the append-only chain unverifiable forever.
+        if not isinstance(graph_id, str):
+            raise AuthorityError("event graph_id must be a string")
+        if node_id is not None and not isinstance(node_id, str):
+            raise AuthorityError("event node_id must be a string or null")
+        if attempt_id is not None and not isinstance(attempt_id, str):
+            raise AuthorityError("event attempt_id must be a string or null")
+        if fence is not None and (isinstance(fence, bool) or not isinstance(fence, int)):
+            raise AuthorityError("event fence must be an integer or null")
+        try:
+            payload_json = _canonical_json(payload)
+        except (TypeError, ValueError) as exc:
+            raise AuthorityError("event payload is not canonically serializable") from exc
+
         event_id = event_id or f"ev-{uuid.uuid4().hex}"
         previous = conn.execute(
             "SELECT event_hash FROM authority_events ORDER BY id DESC LIMIT 1"
@@ -231,7 +556,9 @@ class Phase2AuthorityStore:
             "node_id": node_id,
             "attempt_id": attempt_id,
             "fence": fence,
-            "payload": dict(payload),
+            # Hash the stored representation, not the in-memory object, so the
+            # digest is over exactly the bytes recover() reads back and parses.
+            "payload": json.loads(payload_json),
             "prev_event_hash": prev_hash,
         }
         event_hash = _canonical_hash(row)
@@ -248,7 +575,7 @@ class Phase2AuthorityStore:
                 node_id,
                 attempt_id,
                 fence,
-                _canonical_json(payload),
+                payload_json,
                 prev_hash,
                 event_hash,
             ),
@@ -576,7 +903,7 @@ class Phase2AuthorityStore:
             "lease"
         ].get("holder"):
             raise AuthorityError(f"lease holder cannot {action}")
-        if _canonical_json(dict(envelope)) != _canonical_json(authoritative):
+        if _canonical_identity(envelope) != _canonical_json(authoritative):
             raise AuthorityError(f"non-authoritative envelope cannot {action}")
         return graph_id, node_id, authority
 
@@ -774,8 +1101,13 @@ class Phase2AuthorityStore:
         expired, revoked, superseded, conflicting-duplicate, or forged
         completion appends exactly one typed ``RESULT_REJECTED`` event (bounded
         reason + result_hash) in the same decision transaction, then raises
-        ``ResultRejection``. At most one accepted result per graph/node is
-        backstopped by a partial unique index (contract §5, §9).
+        ``ResultRejection``. A completion whose ``fence`` is not an integer is
+        rejected as ``malformed_fence`` and raises ``MalformedEnvelopeFence``;
+        its rejection event stores ``NULL`` in the fence column and keeps the
+        claim as bounded audit metadata, so an untrusted caller can never write a
+        row whose stored fence differs from the hashed one. At most one accepted
+        result per graph/node is backstopped by a partial unique index
+        (contract §5, §9).
         """
 
         result_hash = _valid_sha256(result_hash, "result_hash")
@@ -791,7 +1123,7 @@ class Phase2AuthorityStore:
                         conn, envelope, result_hash, completed_at
                     )
                 except _Reject as reject:
-                    self._append_rejection(
+                    fence_audit = self._append_rejection(
                         conn,
                         envelope,
                         reject.reason,
@@ -800,6 +1132,13 @@ class Phase2AuthorityStore:
                         fence_hint=reject.fence_hint,
                     )
                     conn.execute("COMMIT")
+                    if fence_audit["claimed_fence_malformed"]:
+                        raise MalformedEnvelopeFence(
+                            reject.reason,
+                            result_hash=result_hash,
+                            claimed_fence_type=fence_audit["claimed_fence_type"],
+                            claimed_fence_repr=fence_audit["claimed_fence_repr"],
+                        ) from None
                     raise ResultRejection(reject.reason, result_hash=result_hash) from None
                 conn.execute("COMMIT")
                 return record
@@ -823,7 +1162,9 @@ class Phase2AuthorityStore:
 
         Identity (graph/node/holder/attempt/fence/canonical envelope) is folded
         in deterministic order so a forgery that is also stale reports the more
-        fundamental staleness reason first.
+        fundamental staleness reason first. A fence that is not an integer is the
+        most fundamental defect of all — it cannot be compared to the
+        authoritative fence at all — so it is decided before staleness.
         """
 
         graph_id = str(envelope.get("graph_id"))
@@ -837,6 +1178,9 @@ class Phase2AuthorityStore:
         if authority is None:
             reject("no_grant")
         assert authority is not None
+        _, fence_audit = _normalize_claimed_fence(envelope.get("fence"))
+        if fence_audit["claimed_fence_malformed"]:
+            reject("malformed_fence", fence_hint=authority["fence"])
         if envelope.get("fence") != authority["fence"]:
             reject("stale_fence", fence_hint=authority["fence"])
         authoritative = authority["envelope"]
@@ -847,7 +1191,7 @@ class Phase2AuthorityStore:
             "lease"
         ].get("holder"):
             reject("holder_mismatch", fence_hint=authority["fence"])
-        if _canonical_json(dict(envelope)) != _canonical_json(authoritative):
+        if _canonical_identity(envelope) != _canonical_json(authoritative):
             reject("envelope_not_authoritative", fence_hint=authority["fence"])
         if authority["completed"]:
             if authority["accepted_result_hash"] == result_hash:
@@ -900,28 +1244,42 @@ class Phase2AuthorityStore:
         now: datetime,
         *,
         fence_hint: int | None = None,
-    ) -> None:
+    ) -> dict[str, Any]:
         """Append one typed RESULT_REJECTED audit event in the decision transaction.
 
         The event is stamped with the caller's claimed fence from the envelope
         (not the current live fence), so the audit trail faithfully records which
-        fence the rejected caller claimed to hold.
+        fence the rejected caller claimed to hold — but only ever in the one
+        representation the integrity hash and ``recover()`` both see. The claimed
+        fence is normalized to ``int | None`` first; a malformed claim stores
+        ``NULL`` in the indexed column and survives as bounded payload metadata.
+        Persisting the raw claim instead would let any rejected caller write a
+        row whose stored fence differs from the hashed one and permanently break
+        chain verification for the whole store.
+
+        Returns the fence audit metadata so the caller can raise the matching
+        typed error.
         """
 
-        # Use the presenting envelope's fence value so the audit record faithfully
-        # captures what the caller claimed. fence_hint is the authoritative
-        # current fence and is recorded in the payload for reconciliation.
-        event_fence = envelope.get("fence")
+        # fence_hint is the authoritative current fence, recorded in the payload
+        # for reconciliation against whatever the rejected caller claimed.
+        claimed_fence, fence_audit = _normalize_claimed_fence(envelope.get("fence"))
         self._append_event(
             conn,
             kind="RESULT_REJECTED",
             graph_id=str(envelope.get("graph_id")),
             node_id=str(envelope.get("node_id")),
             attempt_id=str(envelope.get("attempt_id")) if envelope.get("attempt_id") else None,
-            fence=event_fence,
-            payload={"reason": reason, "result_hash": result_hash, "current_fence": fence_hint},
+            fence=claimed_fence,
+            payload={
+                "reason": reason,
+                "result_hash": result_hash,
+                "current_fence": fence_hint,
+                **fence_audit,
+            },
             now=now,
         )
+        return fence_audit
 
     def current_fence(self, graph_id: str, node_id: str) -> int | None:
         conn = self._connect()
@@ -1080,6 +1438,21 @@ class Phase2AuthorityStore:
         usd: float,
         now: datetime | None = None,
     ) -> str:
+        """Reserve spend against the node budget under exact live authority.
+
+        A reservation is an authoritative spend transition, so it is gated
+        exactly like renew/revoke/complete (contract §9): the caller must present
+        the byte-identical authoritative sealed envelope for the current fence —
+        correct attempt, correct holder, canonical identity — under a lease that
+        is un-revoked, non-terminal, unexpired, and still inside the node
+        deadline. Binding fence and attempt alone would let a non-holder burn the
+        real holder's budget to exhaustion, would accept a non-canonical envelope
+        whose ``fence`` merely compares equal (``1.0 == 1``, ``True == 1``), and
+        would authorize spend past ``deadline_utc`` on a node whose result
+        ``complete_node`` can no longer accept — a grant's TTL is not capped by
+        the deadline, so that window is reachable.
+        """
+
         if isinstance(tokens, bool) or not isinstance(tokens, int) or tokens < 0:
             raise AuthorityError("tokens must be a non-negative integer")
         usd_value = _nonnegative_number(usd, "usd")
@@ -1088,21 +1461,10 @@ class Phase2AuthorityStore:
             conn = self._connect()
             try:
                 conn.execute("BEGIN IMMEDIATE")
-                graph_id = str(envelope.get("graph_id"))
-                node_id = str(envelope.get("node_id"))
-                authority = self._node_authority(conn, graph_id, node_id)
-                if authority is None or envelope.get("fence") != authority["fence"]:
-                    raise AuthorityError("stale fence cannot reserve budget")
-                if authority["revoked"]:
-                    raise AuthorityError("revoked lease cannot reserve budget")
-                if authority["completed"]:
-                    raise AuthorityError("completed node cannot reserve budget")
-                latest_envelope = authority["envelope"]
-                if latest_envelope.get("attempt_id") != envelope.get("attempt_id"):
-                    raise AuthorityError("stale attempt cannot reserve budget")
-                if current >= authority["effective_expires"]:
-                    raise AuthorityError("expired lease cannot reserve budget")
-                state = self._budget_state(conn, graph_id, node_id, int(envelope["fence"]))
+                graph_id, node_id, fence, latest_envelope = self._load_live_authority(
+                    conn, envelope, current, action="reserve budget"
+                )
+                state = self._budget_state(conn, graph_id, node_id, fence)
                 if state["cost_unknown"]:
                     raise AuthorityError("budget cost is unknown")
                 limits = latest_envelope["budgets"]
@@ -1120,8 +1482,8 @@ class Phase2AuthorityStore:
                     kind="BUDGET_RESERVED",
                     graph_id=graph_id,
                     node_id=node_id,
-                    attempt_id=str(envelope["attempt_id"]),
-                    fence=int(envelope["fence"]),
+                    attempt_id=str(latest_envelope["attempt_id"]),
+                    fence=fence,
                     payload={"tokens": tokens, "usd": usd_value},
                     now=current,
                     event_id=reservation_id,
@@ -1324,6 +1686,42 @@ class Phase2AuthorityStore:
                 conn.close()
         return {"orphaned_reservations_reconciled": reconciled_count}
 
+    def migration_report(self) -> dict[str, Any]:
+        """Read-only compatibility diagnostic; never writes, creates, or deletes.
+
+        Works while the authority-serving path is failing closed with
+        :class:`AuthorityMigrationRequired`, because it opens the database
+        read-only and never runs schema creation. Together with
+        :meth:`read_events` this is the quarantine surface: an operator can see
+        exactly which invariants a legacy store violates, and which rows, without
+        the store being able to mutate an authoritative event.
+        """
+
+        report: dict[str, Any] = {
+            "db_path": str(self.db_path),
+            "exists": self.db_path.exists(),
+            "compatible": True,
+            "missing_indexes": [],
+            "violations": [],
+        }
+        if not self.db_path.exists():
+            return report
+        conn = sqlite3.connect(f"file:{self.db_path}?mode=ro", uri=True)
+        try:
+            table = conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'authority_events'"
+            ).fetchone()
+            missing = self._missing_integrity_indexes(conn)
+            report["missing_indexes"] = [index.name for index in missing]
+            if table is None:
+                return report
+            violations = self._scan_integrity_violations(conn, missing)
+            report["violations"] = violations
+            report["compatible"] = not violations
+            return report
+        finally:
+            conn.close()
+
     def get_planner_hash(self, graph_id: str) -> str | None:
         conn = self._connect()
         try:
@@ -1358,4 +1756,11 @@ class Phase2AuthorityStore:
             conn.close()
 
 
-__all__ = ["AuthorityError", "Phase2AuthorityStore", "ResultRejection", "default_db_path"]
+__all__ = [
+    "AuthorityError",
+    "AuthorityMigrationRequired",
+    "MalformedEnvelopeFence",
+    "Phase2AuthorityStore",
+    "ResultRejection",
+    "default_db_path",
+]

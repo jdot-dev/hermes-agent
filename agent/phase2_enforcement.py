@@ -733,10 +733,16 @@ def record_budget_usage(*, tokens: int = 0, usd: float | None = 0.0) -> None:
 
     if isinstance(tokens, bool) or not isinstance(tokens, int) or tokens < 0:
         raise ValueError("tokens must be a non-negative integer")
+    # A non-finite charge is unrecoverable: it poisons the running total, and
+    # every later ceiling comparison against nan is False, so the budget can
+    # never be breached again. Refuse it at the meter instead.
     if usd is not None and (
-        isinstance(usd, bool) or not isinstance(usd, (int, float)) or usd < 0
+        isinstance(usd, bool)
+        or not isinstance(usd, (int, float))
+        or not math.isfinite(usd)
+        or usd < 0
     ):
-        raise ValueError("usd must be a non-negative number or None")
+        raise ValueError("usd must be a finite non-negative number or None")
     budget = _CURRENT_BUDGET.get()
     if budget is None:
         return

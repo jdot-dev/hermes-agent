@@ -29,6 +29,11 @@ _SHA256_RE_LEN = 64
 _FENCE_REPR_MAX = 64
 # Bounded per-invariant sample size in a migration diagnostic.
 _MIGRATION_SAMPLE_MAX = 5
+# SQLite binds an INTEGER column as a signed 64-bit value. A Python int outside
+# this range cannot be bound at all: the INSERT aborts with an untyped
+# ``OverflowError`` raised from the driver, before any audit row exists.
+_SQLITE_INT_MIN = -(2**63)
+_SQLITE_INT_MAX = 2**63 - 1
 
 # Lifecycle event kinds. LEASE_GRANTED carries the sole sealed envelope, which
 # stays immutable forever. LEASE_RENEWED carries bounded external metadata only
@@ -185,15 +190,17 @@ class ResultRejection(AuthorityError):
 
 
 class MalformedEnvelopeFence(ResultRejection):
-    """A completion presented a fence that is not an integer.
+    """A completion presented a fence that is not a durably bindable integer.
 
     Contract v2 requires ``fence`` to be a positive ``int``. A caller-supplied
     ``"1"``, ``1.0``, ``True``, ``[1]``, or ``{}`` is not a fence: it can neither
     be compared against the authoritative fence nor bound to the INTEGER column
     without SQLite type affinity silently rewriting it into a value that no
-    longer matches the integrity hash computed over it. Such a completion is
-    rejected fail-closed, and the claim survives only as bounded audit metadata
-    on the ``RESULT_REJECTED`` event (whose ``fence`` column is ``NULL``).
+    longer matches the integrity hash computed over it. An ``int`` outside the
+    signed 64-bit range (``claimed_fence_reason == "out_of_range"``) is equally
+    unusable — SQLite cannot bind it at all. Such a completion is rejected
+    fail-closed, and the claim survives only as bounded audit metadata on the
+    ``RESULT_REJECTED`` event (whose ``fence`` column is ``NULL``).
 
     Subclasses :class:`ResultRejection` so existing fail-closed handlers keep
     working unchanged.
@@ -204,10 +211,12 @@ class MalformedEnvelopeFence(ResultRejection):
         reason: str,
         *,
         result_hash: str | None = None,
+        claimed_fence_reason: str | None = None,
         claimed_fence_type: str | None = None,
         claimed_fence_repr: str | None = None,
     ) -> None:
         super().__init__(reason, result_hash=result_hash)
+        self.claimed_fence_reason = claimed_fence_reason
         self.claimed_fence_type = claimed_fence_type
         self.claimed_fence_repr = claimed_fence_repr
 
@@ -227,6 +236,32 @@ def default_db_path() -> Path:
 
 def _canonical_json(value: Any) -> str:
     return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+
+
+def _sealed_json(value: Any) -> str:
+    """Canonical JSON for an immutable sealed row, refusing non-finite numbers.
+
+    ``json.dumps`` emits the non-standard tokens ``Infinity``/``NaN`` by
+    default. ``sealed_plans`` and ``sealed_nodes`` are immutable and undeletable
+    by trigger, and a graph_id can only ever be sealed once, so a single
+    ``usd_max: inf`` would permanently wedge that graph behind a plan whose JSON
+    no strict reader can parse and whose ceiling can never be breached
+    (contract §9 requires budget breach to fail closed; ``tokens_max: inf``
+    additionally aborts accounting at ``int(inf)`` with an untyped
+    ``OverflowError``). Refusing at seal time keeps the defect out of the
+    immutable table instead of leaving a permanently ungrantable graph behind.
+    """
+
+    try:
+        return json.dumps(
+            value,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+            allow_nan=False,
+        )
+    except ValueError as exc:
+        raise AuthorityError("sealed plan numbers must be finite") from exc
 
 
 def _canonical_hash(value: Any) -> str:
@@ -277,13 +312,20 @@ def _bounded_repr(value: Any) -> str:
     return text
 
 
+def _bindable_fence(value: int) -> bool:
+    """True if a non-``bool`` ``int`` fits the signed 64-bit ``fence`` column."""
+
+    return _SQLITE_INT_MIN <= value <= _SQLITE_INT_MAX
+
+
 def _normalize_claimed_fence(value: Any) -> tuple[int | None, dict[str, Any]]:
     """Normalize a caller-supplied fence to a column- and hash-stable value.
 
     Returns ``(fence, audit)``. ``fence`` is both bound to the INTEGER ``fence``
-    column and folded into the event hash, so it must be exactly the type SQLite
-    hands back on read: a non-``bool`` ``int``, or ``None``. Every other value is
-    malformed and normalizes to ``None``:
+    column and folded into the event hash, so it must be exactly the type *and*
+    value SQLite hands back on read: a non-``bool`` ``int`` inside the signed
+    64-bit range, or ``None``. Every other value is malformed and normalizes to
+    ``None``:
 
     * ``"1"``, ``1.0`` and ``True`` are silently rewritten to the integer ``1``
       by INTEGER column affinity, so the stored row would no longer reproduce
@@ -291,18 +333,29 @@ def _normalize_claimed_fence(value: Any) -> tuple[int | None, dict[str, Any]]:
       would fail verification forever;
     * ``[1]`` and ``{}`` cannot bind to a SQLite parameter at all and would
       abort the write with an untyped ``sqlite3.ProgrammingError``, losing the
-      audit record entirely.
+      audit record entirely;
+    * ``2**63`` and any other out-of-range ``int`` cannot bind either — SQLite
+      stores signed 64-bit integers — and would abort the write with an untyped
+      ``OverflowError``, likewise losing the audit record. Python ``int`` is
+      unbounded, so this is reachable from any caller-supplied envelope.
 
-    The malformed claim survives as bounded audit metadata instead.
+    The malformed claim survives as bounded audit metadata instead, carrying
+    ``claimed_fence_reason`` so an operator can tell an out-of-range integer
+    apart from a value that was never an integer at all.
     """
 
     if value is None:
         return None, {"claimed_fence": None, "claimed_fence_malformed": False}
     if isinstance(value, int) and not isinstance(value, bool):
-        return value, {"claimed_fence": value, "claimed_fence_malformed": False}
+        if _bindable_fence(value):
+            return value, {"claimed_fence": value, "claimed_fence_malformed": False}
+        reason = "out_of_range"
+    else:
+        reason = "not_an_integer"
     return None, {
         "claimed_fence": None,
         "claimed_fence_malformed": True,
+        "claimed_fence_reason": reason,
         "claimed_fence_type": type(value).__name__,
         "claimed_fence_repr": _bounded_repr(value),
     }
@@ -536,8 +589,14 @@ class Phase2AuthorityStore:
             raise AuthorityError("event node_id must be a string or null")
         if attempt_id is not None and not isinstance(attempt_id, str):
             raise AuthorityError("event attempt_id must be a string or null")
-        if fence is not None and (isinstance(fence, bool) or not isinstance(fence, int)):
-            raise AuthorityError("event fence must be an integer or null")
+        if fence is not None:
+            if isinstance(fence, bool) or not isinstance(fence, int):
+                raise AuthorityError("event fence must be an integer or null")
+            # Range is part of "bindable", not just type: SQLite stores signed
+            # 64-bit integers, so a wider Python int aborts the INSERT with an
+            # untyped OverflowError and no audit row survives the rollback.
+            if not _bindable_fence(fence):
+                raise AuthorityError("event fence must be a signed 64-bit integer")
         try:
             payload_json = _canonical_json(payload)
         except (TypeError, ValueError) as exc:
@@ -603,7 +662,7 @@ class Phase2AuthorityStore:
         for raw in nodes:
             if not isinstance(raw, Mapping):
                 raise AuthorityError("each plan node must be an object")
-            node = json.loads(_canonical_json(raw))
+            node = json.loads(_sealed_json(raw))
             node_id = node.get("node_id")
             if not isinstance(node_id, str) or not node_id.strip():
                 raise AuthorityError("node_id is required")
@@ -629,7 +688,7 @@ class Phase2AuthorityStore:
 
         graph_id, nodes = self._validate_plan(plan, policy_hash)
         sealed_at = _utc(now)
-        canonical_plan = json.loads(_canonical_json(plan))
+        canonical_plan = json.loads(_sealed_json(plan))
         planner_hash = _canonical_hash(canonical_plan)
         with _DB_LOCK:
             conn = self._connect()
@@ -644,11 +703,11 @@ class Phase2AuthorityStore:
                            graph_id, contract_version, planner_hash, policy_hash,
                            plan_json, sealed_utc
                        ) VALUES (?, 2, ?, ?, ?, ?)""",
-                    (graph_id, planner_hash, policy_hash, _canonical_json(canonical_plan), _iso(sealed_at)),
+                    (graph_id, planner_hash, policy_hash, _sealed_json(canonical_plan), _iso(sealed_at)),
                 )
                 conn.executemany(
                     "INSERT INTO sealed_nodes(graph_id, node_id, node_json) VALUES (?, ?, ?)",
-                    [(graph_id, node["node_id"], _canonical_json(node)) for node in nodes],
+                    [(graph_id, node["node_id"], _sealed_json(node)) for node in nodes],
                 )
                 self._append_event(
                     conn,
@@ -1101,8 +1160,9 @@ class Phase2AuthorityStore:
         expired, revoked, superseded, conflicting-duplicate, or forged
         completion appends exactly one typed ``RESULT_REJECTED`` event (bounded
         reason + result_hash) in the same decision transaction, then raises
-        ``ResultRejection``. A completion whose ``fence`` is not an integer is
-        rejected as ``malformed_fence`` and raises ``MalformedEnvelopeFence``;
+        ``ResultRejection``. A completion whose ``fence`` is not an integer, or
+        is an integer too wide for the signed 64-bit column, is rejected as
+        ``malformed_fence`` and raises ``MalformedEnvelopeFence``;
         its rejection event stores ``NULL`` in the fence column and keeps the
         claim as bounded audit metadata, so an untrusted caller can never write a
         row whose stored fence differs from the hashed one. At most one accepted
@@ -1136,6 +1196,7 @@ class Phase2AuthorityStore:
                         raise MalformedEnvelopeFence(
                             reject.reason,
                             result_hash=result_hash,
+                            claimed_fence_reason=fence_audit["claimed_fence_reason"],
                             claimed_fence_type=fence_audit["claimed_fence_type"],
                             claimed_fence_repr=fence_audit["claimed_fence_repr"],
                         ) from None
@@ -1162,9 +1223,10 @@ class Phase2AuthorityStore:
 
         Identity (graph/node/holder/attempt/fence/canonical envelope) is folded
         in deterministic order so a forgery that is also stale reports the more
-        fundamental staleness reason first. A fence that is not an integer is the
-        most fundamental defect of all — it cannot be compared to the
-        authoritative fence at all — so it is decided before staleness.
+        fundamental staleness reason first. A fence that is not a durably
+        bindable integer is the most fundamental defect of all — it cannot be
+        recorded against the authoritative fence at all — so it is decided
+        before staleness.
         """
 
         graph_id = str(envelope.get("graph_id"))
@@ -1468,13 +1530,19 @@ class Phase2AuthorityStore:
                 if state["cost_unknown"]:
                     raise AuthorityError("budget cost is unknown")
                 limits = latest_envelope["budgets"]
-                if state["charged_tokens"] + state["reserved_tokens"] + tokens > int(
-                    limits["tokens_max"]
-                ):
+                # A grant validates its envelope, but a legacy store sealed
+                # before that check could still hold ``tokens_max: inf`` — and
+                # ``int(inf)`` aborts the reservation with an untyped
+                # OverflowError instead of a typed, auditable refusal. A
+                # non-finite ceiling is also unbreachable, so it must never
+                # authorize spend.
+                tokens_max = int(
+                    _nonnegative_number(limits.get("tokens_max"), "sealed budgets.tokens_max")
+                )
+                usd_max = _nonnegative_number(limits.get("usd_max"), "sealed budgets.usd_max")
+                if state["charged_tokens"] + state["reserved_tokens"] + tokens > tokens_max:
                     raise AuthorityError("token budget reservation exceeds node budget")
-                if state["charged_usd"] + state["reserved_usd"] + usd_value > float(
-                    limits["usd_max"]
-                ):
+                if state["charged_usd"] + state["reserved_usd"] + usd_value > usd_max:
                     raise AuthorityError("USD budget reservation exceeds node budget")
                 reservation_id = f"res-{uuid.uuid4().hex}"
                 self._append_event(

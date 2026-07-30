@@ -17,6 +17,7 @@ The parent's context only sees the delegation call and the summary result,
 never the child's intermediate tool calls or reasoning.
 """
 
+import copy
 import enum
 import contextvars
 import json
@@ -41,6 +42,11 @@ from agent.interrupt_compat import request_hard_interrupt
 # not natively known (named custom providers, third-party aggregators, etc.).
 # Must match hermes_cli.runtime_provider.RUNTIME_PROVIDER_TYPE_CUSTOM.
 _RUNTIME_PROVIDER_CUSTOM = "custom"
+
+_DELEGATION_ROUTE_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
+_DELEGATION_ROUTE_FIELDS = frozenset(
+    {"model", "provider", "base_url", "api_key", "api_mode"}
+)
 from tools import file_state
 from tools.terminal_tool import set_approval_callback as _set_subagent_approval_cb
 from utils import base_url_hostname, is_truthy_value
@@ -1776,13 +1782,33 @@ def _build_child_agent(
     else:
         parent_toolsets = set(DEFAULT_TOOLSETS)
 
-    if toolsets:
+    # Operator-owned defaults can narrow every child without exposing toolset
+    # selection to the model. Absent or malformed config preserves the legacy
+    # parent-inheritance behavior. A configured empty list intentionally gives
+    # leaf children no enabled toolsets.
+    configured_default_toolsets = delegation_cfg.get("default_toolsets")
+    if toolsets is None and isinstance(configured_default_toolsets, list):
+        using_configured_default_toolsets = True
+        requested_toolsets: Optional[List[str]] = [
+            item.strip()
+            for item in configured_default_toolsets
+            if isinstance(item, str) and item.strip()
+        ]
+    else:
+        using_configured_default_toolsets = False
+        requested_toolsets = toolsets
+
+    if requested_toolsets is not None:
         # Intersect with parent — subagent must not gain tools the parent lacks.
         # Expand composite toolsets (e.g. hermes-cli) so that individual
         # toolset names (e.g. web, terminal) are recognised during intersection.
         expanded_parent = _expand_parent_toolsets(parent_toolsets)
-        child_toolsets = [t for t in toolsets if t in expanded_parent]
-        if _get_inherit_mcp_toolsets():
+        child_toolsets = [t for t in requested_toolsets if t in expanded_parent]
+        # An operator-owned default is a hard ceiling over every toolset,
+        # including MCP. Preserve legacy MCP inheritance only for explicit
+        # per-child narrowing; otherwise an omitted MCP name would silently
+        # widen the configured ceiling.
+        if not using_configured_default_toolsets and _get_inherit_mcp_toolsets():
             child_toolsets = _preserve_parent_mcp_toolsets(
                 child_toolsets, parent_toolsets
             )
@@ -2566,6 +2592,89 @@ def _apply_summary_budget(results: List[Dict[str, Any]], parent_agent) -> None:
         )
 
 
+def _child_observed_usage(child) -> tuple[int, Optional[float]]:
+    """Observed child spend for reconciliation.
+
+    Returns ``(tokens, usd)``.  ``usd`` is ``None`` when the child cannot
+    report a real number — an abandoned, wedged, or mock child.  Unknown cost
+    is not zero cost: it poisons the parent's fence so nothing further can be
+    reserved against a spend nobody can account for.
+    """
+    tokens = 0
+    for attr in ("session_prompt_tokens", "session_completion_tokens"):
+        value = getattr(child, attr, 0)
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            tokens += max(0, int(value))
+    cost = getattr(child, "session_estimated_cost_usd", None)
+    if isinstance(cost, bool) or not isinstance(cost, (int, float)) or cost < 0:
+        return tokens, None
+    return tokens, float(cost)
+
+
+def _child_authority_result(entry: Dict[str, Any]) -> Dict[str, Any]:
+    """The exact, stable child outcome identity that acceptance is hashed over.
+
+    Only fields the child actually determined — no wall clock, no paths, no
+    parent-side annotations — so redelivering the same result reconciles
+    idempotently instead of minting a second acceptance.
+    """
+    return {
+        "task_index": entry.get("task_index"),
+        "status": entry.get("status"),
+        "exit_reason": entry.get("exit_reason"),
+        "summary": entry.get("summary"),
+        "api_calls": entry.get("api_calls"),
+    }
+
+
+def _settle_child_entry(entry: Dict[str, Any], settlement, task_index: int, child) -> Dict[str, Any]:
+    """Close one child's sealed authority from its observed outcome, once.
+
+    A completed child is accepted against its own node; anything else
+    (failed/error/timeout/interrupted) is terminally revoked without acceptance.
+    An acceptance the store rejects — stale attempt, revoked lease, superseded
+    fence — downgrades the entry: the parent never reports success the control
+    plane refused.
+
+    ``already_settled`` is only a success when the prior settlement was itself
+    an acceptance.  A worker that finishes after the parent abandoned it loses
+    the claim to a revocation, and its late "completed" must not be reported as
+    a success the control plane already closed.
+    """
+    if settlement is None or settlement.authority(task_index) is None:
+        return entry
+    tokens, usd = _child_observed_usage(child)
+    if entry.get("status") == "completed":
+        outcome = settlement.accept(
+            task_index,
+            _child_authority_result(entry),
+            actual_tokens=tokens,
+            actual_usd=usd,
+        )
+        settled = outcome.get("outcome")
+        accepted = settled == "accepted" or (
+            settled == "already_settled" and outcome.get("prior_outcome") == "accepted"
+        )
+        if not accepted:
+            entry["status"] = "failed"
+            entry["exit_reason"] = "authority_rejected"
+            entry["error"] = (
+                "Subagent result was not accepted by its sealed authority: "
+                f"{outcome.get('detail') or outcome.get('prior_outcome') or settled}"
+            )
+    else:
+        outcome = settlement.close(
+            task_index,
+            reason=str(entry.get("status") or "failed"),
+            actual_tokens=tokens,
+            actual_usd=usd,
+        )
+    entry["parent_action_id"] = outcome.get("parent_action_id")
+    entry["child_action_id"] = outcome.get("child_action_id")
+    entry["authority_outcome"] = outcome.get("outcome")
+    return entry
+
+
 def _run_single_child(
     task_index: int,
     goal: str,
@@ -2575,6 +2684,32 @@ def _run_single_child(
     owner_session_id: Optional[str] = None,
     owner_transport: Any = None,
     owner_session_record: Any = None,
+    settlement=None,
+    **_kwargs,
+) -> Dict[str, Any]:
+    """Run one pre-built child and settle its sealed authority exactly once."""
+    if child is None or parent_agent is None:
+        raise ValueError("child and parent_agent are required")
+    child_authority = settlement.authority(task_index) if settlement is not None else None
+    child_authority_store = settlement.store if settlement is not None else None
+    try:
+        entry = _run_child_conversation(
+            task_index, goal, child=child, parent_agent=parent_agent,
+            owner_session_id=owner_session_id, owner_transport=owner_transport,
+            owner_session_record=owner_session_record, child_authority=child_authority,
+            child_authority_store=child_authority_store,
+        )
+    except BaseException:
+        if settlement is not None:
+            settlement.close(task_index, reason="child_raised", actual_tokens=_child_observed_usage(child)[0], actual_usd=None)
+        raise
+    return _settle_child_entry(entry, settlement, task_index, child)
+
+
+def _run_child_conversation(
+    task_index: int, goal: str, child=None, parent_agent=None, *,
+    owner_session_id: Optional[str] = None, owner_transport: Any = None,
+    owner_session_record: Any = None, child_authority=None, child_authority_store=None,
     **_kwargs,
 ) -> Dict[str, Any]:
     """
@@ -2601,6 +2736,9 @@ def _run_single_child(
     ``truncated`` is derived as ``exit_reason == "max_iterations"`` only, so the
     parent-visible truncation flag stays truthful for all of the above.
     """
+    if child is None or parent_agent is None:
+        raise ValueError("child and parent_agent are required")
+
     child_start = time.monotonic()
 
     # Get the progress callback from the child agent
@@ -2949,19 +3087,16 @@ def _run_single_child(
         def _run_with_thread_capture():
             _worker_thread_holder["t"] = threading.current_thread()
             from agent.delegation_context import delegated_child_context
+            from agent import phase2_enforcement as _p2e
 
             with delegated_child_context(str(getattr(child, "session_id", "") or "")):
-                return child.run_conversation(
-                    user_message=goal,
-                    task_id=child_task_id,
-                    stream_callback=_relay_child_text,
-                )
+                if child_authority is None:
+                    return child.run_conversation(user_message=goal, task_id=child_task_id, stream_callback=_relay_child_text)
+                with _p2e.bind_delegate_child_authority(child_authority, store=child_authority_store):
+                    return child.run_conversation(user_message=goal, task_id=child_task_id, stream_callback=_relay_child_text)
 
         _child_context = contextvars.copy_context()
-        _child_future = _timeout_executor.submit(
-            _child_context.run,
-            _run_with_thread_capture,
-        )
+        _child_future = _timeout_executor.submit(_child_context.run, _run_with_thread_capture)
         try:
             result = _child_future.result(timeout=child_timeout)
         except Exception as _timeout_exc:
@@ -3783,6 +3918,7 @@ def delegate_task(
     tasks: Optional[List[Dict[str, Any]]] = None,
     max_iterations: Optional[int] = None,
     role: Optional[str] = None,
+    route: Optional[str] = None,
     background: Optional[bool] = None,
     output_schema: Optional[Dict[str, Any]] = None,
     action: Optional[str] = None,
@@ -3796,8 +3932,8 @@ def delegate_task(
     already-running ones.
 
     Spawn modes (action='spawn' or omitted):
-      - Single: provide goal (+ optional context and role)
-      - Batch:  provide tasks array [{goal, context, role}, ...]
+      - Single: provide goal (+ optional context, role, and configured route)
+      - Batch:  provide tasks array [{goal, context, role, route}, ...]
 
     Control modes (synchronous, never backgrounded):
       - action='list'  -> live children of this conversation's spawn tree
@@ -3809,9 +3945,59 @@ def delegate_task(
     'leaf' (default) cannot; 'orchestrator' retains the delegation
     toolset and can spawn its own workers, bounded by
     delegation.max_spawn_depth.  Per-task role beats the top-level one.
+    In batch mode, routes are selected per task; the top-level route is only
+    used as a fallback when a task omits its own route.
 
     Returns JSON with results array, one entry per task.
     """
+    # Authority backstop.  Child allocations are reserved on the parent's fence
+    # before any worker is built, so every path out of the implementation that
+    # does *not* hand the batch to a runner — an early tool_error, a raising
+    # child build, an interrupt — must terminally close the children it
+    # reserved.  The background path releases ownership explicitly, because its
+    # children outlive this call and settle on the daemon thread.
+    authority_box: Dict[str, Any] = {}
+    try:
+        return _delegate_task_impl(
+            goal=goal,
+            context=context,
+            tasks=tasks,
+            max_iterations=max_iterations,
+            role=role,
+            route=route,
+            background=background,
+            output_schema=output_schema,
+            action=action,
+            subagent_id=subagent_id,
+            message=message,
+            parent_agent=parent_agent,
+            _authority_box=authority_box,
+        )
+    finally:
+        settlement = authority_box.get("settlement")
+        if settlement is not None and not authority_box.get("released"):
+            try:
+                settlement.close_remaining(reason="delegation_aborted")
+            except Exception:
+                logger.debug("Delegate child authority abort-close failed", exc_info=True)
+
+
+def _delegate_task_impl(
+    goal: Optional[str] = None,
+    context: Optional[str] = None,
+    tasks: Optional[List[Dict[str, Any]]] = None,
+    max_iterations: Optional[int] = None,
+    role: Optional[str] = None,
+    route: Optional[str] = None,
+    background: Optional[bool] = None,
+    output_schema: Optional[Dict[str, Any]] = None,
+    action: Optional[str] = None,
+    subagent_id: Optional[str] = None,
+    message: Optional[str] = None,
+    parent_agent=None,
+    _authority_box: Optional[Dict[str, Any]] = None,
+) -> str:
+    """Body of :func:`delegate_task`; see there for the caller contract."""
     if parent_agent is None:
         return tool_error("delegate_task requires a parent agent context.")
 
@@ -3878,24 +4064,6 @@ def delegate_task(
         )
     effective_max_iter = default_max_iter
 
-    # Resolve delegation credentials (provider:model pair).
-    # When delegation.provider is configured, this resolves the full credential
-    # bundle (base_url, api_key, api_mode) via the same runtime provider system
-    # used by CLI/gateway startup.  When unconfigured, returns None values so
-    # children inherit from the parent.
-    #
-    # ``credentials_cfg`` (internal callers only — never model-facing) is a
-    # per-call override shaped like the delegation config section
-    # ({provider, model, base_url, api_key, api_mode}); the /review engine
-    # uses it to route its reviewer subagent onto ``auxiliary.review``
-    # without touching the global delegation pin.
-    try:
-        creds = _resolve_delegation_credentials(
-            credentials_cfg if credentials_cfg else cfg, parent_agent
-        )
-    except ValueError as exc:
-        return tool_error(str(exc))
-
     # Normalize to task list
     max_children = _get_max_concurrent_children()
     recovered_tasks, tasks_error = _recover_tasks_from_json_string(tasks)
@@ -3922,7 +4090,12 @@ def delegate_task(
             )
         task_list = tasks
     elif goal and isinstance(goal, str) and goal.strip():
-        single_task: Dict[str, Any] = {"goal": goal, "context": context, "role": top_role}
+        single_task: Dict[str, Any] = {
+            "goal": goal,
+            "context": context,
+            "role": top_role,
+            "route": route,
+        }
         if output_schema is not None:
             single_task["output_schema"] = output_schema
         task_list = [single_task]
@@ -3935,6 +4108,58 @@ def delegate_task(
 
     if not task_list:
         return tool_error("No tasks provided.")
+
+    # One canonical request shape, fixed before anything is resolved, reserved,
+    # or dispatched.  Task items are closed against _ALLOWED_TASK_KEYS: a nested
+    # 'tasks' array, an authority-shaped key, or any other unknown field is
+    # rejected outright rather than ignored, so a single request can never
+    # describe two different task sets — one that selects the sealed grants and
+    # another that names the goals children actually run.  Authority is never an
+    # argument: no caller — model, plugin, or direct Python — can name, mint, or
+    # select the grant a child runs under; children resolve from the sealed
+    # graph only.
+    task_list, shape_error = _canonical_task_list(task_list)
+    if shape_error:
+        return tool_error(shape_error)
+
+    # With envelope enforcement enabled, resolve every child exclusively from
+    # the sealed graph and reserve every allocation atomically before any worker
+    # is constructed.  The resulting objects are internal-only.
+    child_settlement = None
+    from agent import phase2_enforcement
+
+    if phase2_enforcement.is_enabled():
+        try:
+            child_authority_store = phase2_enforcement._authority_store()
+            child_authorities = phase2_enforcement.prepare_delegate_child_authority(
+                {"tasks": task_list},
+                store=child_authority_store,
+            )
+            child_settlement = phase2_enforcement.DelegateChildSettlement(
+                dict(enumerate(child_authorities)), store=child_authority_store
+            )
+            if _authority_box is not None:
+                _authority_box["settlement"] = child_settlement
+            # Fail closed on any arity drift between what was reserved and what
+            # will be dispatched.  A surplus grant would otherwise stay reserved
+            # against the parent's fence with no job to settle it, and a deficit
+            # would run a job with no sealed authority at all.  The settlement is
+            # already registered above, so the abort path terminally closes every
+            # child reserved a moment ago.
+            if len(child_authorities) != len(task_list):
+                raise RuntimeError(
+                    f"prepared {len(child_authorities)} sealed children for "
+                    f"{len(task_list)} dispatched tasks"
+                )
+        except Exception as exc:
+            return json.dumps(
+                phase2_enforcement.EnforcementBlock(
+                    "missing_child_authority",
+                    "Delegation is blocked until every worker has graph-bound sealed authority",
+                    (str(exc),),
+                ).to_dict(),
+                ensure_ascii=False,
+            )
 
     # Validate each task has a goal
     for i, task in enumerate(task_list):
@@ -3972,6 +4197,39 @@ def delegate_task(
             return tool_error(f"Task {i} output_schema invalid: {schema_err}")
         task_schemas.append(coerced_schema)
 
+    # Validate every route before resolving any credentials. This keeps a later
+    # invalid batch item from triggering provider lookup, credential loading, or
+    # any other route-specific side effect for an earlier valid item.
+    effective_routes: List[Optional[str]] = [
+        task.get("route") or route for task in task_list
+    ]
+    try:
+        route_cfgs = [
+            _resolve_delegation_route_config(cfg, effective_route)
+            for effective_route in effective_routes
+        ]
+    except ValueError as exc:
+        return tool_error(str(exc))
+
+    # Resolve each child's provider:model bundle independently only after the
+    # whole batch's operator-owned route names have passed validation.
+    # ``credentials_cfg`` (internal callers only — never model-facing) is a
+    # per-call override shaped like the delegation config section
+    # ({provider, model, base_url, api_key, api_mode}); the /review engine
+    # uses it to route its reviewer subagent onto ``auxiliary.review``
+    # without touching the global delegation pin. It wins over route
+    # resolution exactly as it won over ``cfg`` before routes existed.
+    task_creds: List[Dict[str, Any]] = []
+    try:
+        for route_cfg in route_cfgs:
+            task_creds.append(
+                _resolve_delegation_credentials(
+                    credentials_cfg if credentials_cfg else route_cfg, parent_agent
+                )
+            )
+    except ValueError as exc:
+        return tool_error(str(exc))
+
     overall_start = time.monotonic()
     results = []
 
@@ -3990,8 +4248,21 @@ def delegate_task(
         wrap_progress_callback,
     )
 
+    manifest_identities = [
+        (
+            item.get("model") or getattr(parent_agent, "model", None),
+            item.get("provider") or getattr(parent_agent, "provider", None),
+        )
+        for item in task_creds
+    ]
+    manifest_model, manifest_provider = manifest_identities[0]
+    if len(set(manifest_identities)) != 1:
+        manifest_model = manifest_provider = "mixed"
     live_deleg_id, live_writers, live_paths = create_live_transcripts(
-        task_list, context, model=creds.get("model"), provider=creds.get("provider")
+        task_list,
+        context,
+        model=manifest_model,
+        provider=manifest_provider,
     )
 
     # Capture the ORIGINATING session's wake target BEFORE any child agent is
@@ -4022,6 +4293,7 @@ def delegate_task(
     # subagent-lifecycle API).
     children = []
     for i, t in enumerate(task_list):
+        creds = task_creds[i]
         # Per-task role beats top-level; normalise again so unknown
         # per-task values warn and degrade to leaf uniformly.
         effective_role = _normalize_role(t.get("role") or top_role)
@@ -4104,6 +4376,7 @@ def delegate_task(
                 owner_session_id=_origin_ui_session_id or None,
                 owner_transport=_origin_owner_transport,
                 owner_session_record=_origin_owner_session_record,
+                settlement=child_settlement,
             )
             results.append(result)
         else:
@@ -4129,6 +4402,7 @@ def delegate_task(
                         owner_session_id=_origin_ui_session_id or None,
                         owner_transport=_origin_owner_transport,
                         owner_session_record=_origin_owner_session_record,
+                        settlement=child_settlement,
                     )
                     futures[future] = i
 
@@ -4179,6 +4453,28 @@ def delegate_task(
                                         _child_by_index.get(idx), "_delegate_role", None
                                     ),
                                 }
+                                # Revoke now rather than waiting on the
+                                # abandoned worker: the child keeps running on a
+                                # daemon thread and may finish after we stop
+                                # looking.  Closing its lease here means that
+                                # late work can never be accepted as a success
+                                # the parent already reported as interrupted.
+                                if child_settlement is not None:
+                                    _closed = child_settlement.close(
+                                        idx,
+                                        reason="parent_interrupted",
+                                        actual_tokens=_child_observed_usage(
+                                            _child_by_index.get(idx)
+                                        )[0],
+                                        actual_usd=None,
+                                    )
+                                    entry["parent_action_id"] = _closed.get(
+                                        "parent_action_id"
+                                    )
+                                    entry["child_action_id"] = _closed.get(
+                                        "child_action_id"
+                                    )
+                                    entry["authority_outcome"] = _closed.get("outcome")
                             results.append(entry)
                             completed_count += 1
                         break
@@ -4402,7 +4698,12 @@ def delegate_task(
         def _batch_runner():
             # This batch is detached from the foreground turn. Its lifecycle is
             # owned by the async registry and cancelled only via _batch_interrupt.
-            return _execute_and_aggregate(honor_parent_interrupt=False)
+            try:
+                return _execute_and_aggregate(honor_parent_interrupt=False)
+            except BaseException:
+                if child_settlement is not None:
+                    child_settlement.close_remaining(reason="background_batch_failed")
+                raise
 
         def _batch_interrupt():
             for _c in _child_agents:
@@ -4412,6 +4713,16 @@ def delegate_task(
                         _c._interrupt_requested = True
                 except Exception:
                     pass
+            # Cancellation is terminal for authority even though the daemon
+            # threads may still be unwinding: revoke every child that has not
+            # already settled so none of them can land as a success.
+            if child_settlement is not None:
+                try:
+                    child_settlement.close_remaining(reason="async_cancelled")
+                except Exception:
+                    logger.debug(
+                        "Delegate child authority cancel-close failed", exc_info=True
+                    )
 
         def _batch_progress():
             # Progress token for the async registry's stale monitor: the
@@ -4446,6 +4757,21 @@ def delegate_task(
             return tuple(parts), in_tool
 
         _goals = [t["goal"] for t in task_list]
+        _route_identities = [
+            (
+                effective_routes[index],
+                item.get("model") or getattr(parent_agent, "model", None),
+                item.get("provider") or getattr(parent_agent, "provider", None),
+                item.get("base_url") or getattr(parent_agent, "base_url", None),
+                item.get("api_mode") or getattr(parent_agent, "api_mode", None),
+            )
+            for index, item in enumerate(task_creds)
+        ]
+        _dispatch_model = (
+            _route_identities[0][1]
+            if _route_identities and len(set(_route_identities)) == 1
+            else "mixed"
+        )
         dispatch = dispatch_async_delegation_batch(
             goals=_goals,
             context=context,
@@ -4453,7 +4779,7 @@ def delegate_task(
             # parent's toolsets (no model-facing toolsets arg).
             toolsets=None,
             role=top_role,
-            model=creds["model"],
+            model=_dispatch_model,
             session_key=_session_key,
             origin_ui_session_id=_origin_ui_session_id,
             origin_session_id=_wake_sid,
@@ -4468,6 +4794,11 @@ def delegate_task(
         )
 
         if dispatch.get("status") == "dispatched":
+            # Ownership of every child's settlement moves to _batch_runner /
+            # _batch_interrupt now; the caller-side backstop must not close
+            # children that are legitimately still running in the background.
+            if _authority_box is not None:
+                _authority_box["released"] = True
             n = len(_goals)
             note = (
                 "Subagent is running in the background. You and the user can "
@@ -4654,6 +4985,53 @@ def _merge_request_overrides(runtime_overrides, explicit_overrides):
     elif explicit_extra is not None:
         merged["extra_body"] = explicit_extra
     return merged or None
+
+
+def _configured_delegation_routes(cfg: dict) -> Dict[str, Dict[str, Any]]:
+    """Return valid operator-owned route presets from delegation.routes."""
+    raw_routes = cfg.get("routes")
+    if not isinstance(raw_routes, dict):
+        return {}
+    routes: Dict[str, Dict[str, Any]] = {}
+    for raw_name, raw_route in raw_routes.items():
+        if not isinstance(raw_name, str) or not _DELEGATION_ROUTE_NAME_RE.fullmatch(raw_name):
+            continue
+        if not isinstance(raw_route, dict):
+            continue
+        routes[raw_name] = {
+            key: value
+            for key, value in raw_route.items()
+            if key in _DELEGATION_ROUTE_FIELDS
+        }
+    return routes
+
+
+def _resolve_delegation_route_config(
+    cfg: dict, route_name: Optional[str]
+) -> dict:
+    """Overlay a named route onto legacy delegation config.
+
+    Route names are model-selectable only after the operator configures them.
+    Raw route definitions are copied and only allowlisted provider fields are
+    overlaid; delegation.routes is never forwarded to credential resolution.
+    """
+    if route_name is None or not str(route_name).strip():
+        return cfg
+    route_name = str(route_name).strip()
+    routes = _configured_delegation_routes(cfg)
+    if route_name not in routes:
+        available = ", ".join(sorted(routes)) or "none"
+        raise ValueError(
+            f"Unknown delegation route '{route_name}'. "
+            f"Configured routes: {available}."
+        )
+    effective = {
+        key: copy.deepcopy(value)
+        for key, value in cfg.items()
+        if key != "routes"
+    }
+    effective.update(copy.deepcopy(routes[route_name]))
+    return effective
 
 
 def _resolve_delegation_credentials(cfg: dict, parent_agent) -> dict:
@@ -5045,7 +5423,34 @@ def _build_dynamic_schema_overrides() -> dict:
     overrides_params["properties"] = {
         k: dict(v) for k, v in DELEGATE_TASK_SCHEMA["parameters"]["properties"].items()
     }
+    overrides_params["properties"]["tasks"] = copy.deepcopy(
+        DELEGATE_TASK_SCHEMA["parameters"]["properties"]["tasks"]
+    )
     overrides_params["properties"]["tasks"]["description"] = _build_tasks_param_description()
+
+    route_names = sorted(_configured_delegation_routes(_load_config()))
+    if route_names:
+        route_schema = {
+            "type": "string",
+            "enum": route_names,
+            "description": (
+                "Select an operator-configured delegation route. Only the "
+                "listed route names are accepted; provider/model endpoints "
+                "remain controlled by config.yaml."
+            ),
+        }
+        overrides_params["properties"]["route"] = dict(route_schema)
+        overrides_params["properties"]["route"]["description"] = (
+            "Route for single-task mode. " + route_schema["description"]
+        )
+        overrides_params["properties"]["tasks"]["items"]["properties"][
+            "route"
+        ] = dict(route_schema)
+        overrides_params["properties"]["tasks"]["items"]["properties"][
+            "route"
+        ]["description"] = (
+            "Per-task route override. " + route_schema["description"]
+        )
 
     return {
         "description": _build_top_level_description(),
@@ -5181,7 +5586,56 @@ def _model_background_value(args: dict, parent_agent=None) -> bool:
     return not is_subagent
 
 
-_MODEL_HIDDEN_TASK_FIELDS = {"acp_command", "acp_args"}
+_MODEL_HIDDEN_TASK_FIELDS = {
+    "acp_command",
+    "acp_args",
+    "child_envelope",
+    "parent_action_id",
+    "budget_reservation_id",
+}
+
+# The complete set of fields a delegate task item may carry.  Everything the
+# implementation reads off a task is here; anything else is a protocol error.
+_ALLOWED_TASK_KEYS = frozenset({"goal", "context", "role", "route", "output_schema"})
+
+
+def _canonical_task_list(
+    task_list: List[Any],
+) -> tuple[List[Dict[str, Any]], Optional[str]]:
+    """Return one canonical task list, or ``(_, error)`` if the request is not one.
+
+    Delegation resolves sealed child authority from the same list it dispatches
+    workers from, so the shape has to be decided exactly once, before either.
+    Unknown keys are rejected instead of dropped: a silently ignored nested
+    ``tasks`` array is precisely how a request can name one set of goals for
+    authority resolution and run a different set.
+    """
+
+    canonical: List[Dict[str, Any]] = []
+    for index, task in enumerate(task_list):
+        if not isinstance(task, dict):
+            return [], f"Task {index} must be an object, got {type(task).__name__}."
+        unknown = sorted(set(map(str, task)) - _ALLOWED_TASK_KEYS)
+        if unknown:
+            return [], (
+                f"Task {index} has unsupported field(s): {', '.join(unknown)}. "
+                f"Allowed fields: {', '.join(sorted(_ALLOWED_TASK_KEYS))}."
+            )
+        goal = task.get("goal")
+        if not isinstance(goal, str) or not goal.strip():
+            return [], f"Task {index} is missing a 'goal'."
+        role = task.get("role")
+        if role is not None and role not in ("leaf", "orchestrator"):
+            return [], (
+                f"Task {index} has an unrecognized role {role!r}; "
+                "expected 'leaf' or 'orchestrator'."
+            )
+        for field in ("context", "route"):
+            value = task.get(field)
+            if value is not None and not isinstance(value, str):
+                return [], f"Task {index} field '{field}' must be a string."
+        canonical.append(dict(task))
+    return canonical, None
 
 
 def _strip_model_hidden_task_fields(tasks: Any) -> Any:
@@ -5213,6 +5667,7 @@ registry.register(
         tasks=_strip_model_hidden_task_fields(args.get("tasks")),
         max_iterations=args.get("max_iterations"),
         role=args.get("role"),
+        route=args.get("route"),
         background=_model_background_value(args, kw.get("parent_agent")),
         output_schema=args.get("output_schema"),
         action=args.get("action"),

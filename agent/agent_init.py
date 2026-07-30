@@ -1308,12 +1308,48 @@ def init_agent(
         pass
     # Hermes-owned durable Phase 2 authority. Construct exactly one profile-scoped
     # store per agent at startup; enforcement never manufactures authority lazily.
-    from agent.phase2_authority import Phase2AuthorityStore
+    from agent.phase2_authority import AuthorityMigrationRequired, Phase2AuthorityStore
     from agent.phase2_enforcement import is_enabled as phase2_enforcement_enabled
 
     agent.phase2_authority = Phase2AuthorityStore(hermes_home / "phase2_authority.db")
+    agent.phase2_authority_degraded = None
     if phase2_enforcement_enabled():
-        agent.phase2_authority.recover()
+        try:
+            agent.phase2_authority.recover()
+        except AuthorityMigrationRequired as exc:
+            # The durable store holds authoritative rows that violate a Phase 3
+            # integrity invariant. Enforcement stays ON and the quarantined
+            # store stays bound: every authority-serving call re-raises this
+            # same typed error out of ``_connect``, so no node can be granted,
+            # bound, or completed while the store is in this state. Startup
+            # continues only so an operator can still reach the read-only
+            # quarantine surface (``migration_report()`` / ``read_events()``)
+            # and the CLI that runs it — the degradation is recorded and
+            # reported here instead of surfacing as an unactionable traceback.
+            # It is never resolved by disabling enforcement or by swapping in a
+            # fresh store, either of which would silently un-gate execution.
+            agent.phase2_authority_degraded = {
+                "reason": "authority_migration_required",
+                "db_path": exc.db_path,
+                "violations": [dict(violation) for violation in exc.violations],
+                "enforcement_enabled": True,
+                "detail": str(exc),
+            }
+            logger.error("Phase 2 authority store requires migration: %s", exc)
+            if not agent.quiet_mode:
+                violated = ", ".join(
+                    f"{violation['invariant']} "
+                    f"({violation['violating_groups']} violating group(s))"
+                    for violation in exc.violations
+                )
+                print(
+                    "⛔ Phase 2 authority store QUARANTINED — enforcement stays ON, so "
+                    "every sealed-node grant, bind, and completion fails closed.\n"
+                    f"   store:    {exc.db_path}\n"
+                    f"   violated: {violated}\n"
+                    "   detail:   "
+                    f"{exc}"
+                )
 
     # Track conversation messages for session logging
     agent._session_messages: List[Dict[str, Any]] = []

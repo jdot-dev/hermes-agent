@@ -12,8 +12,17 @@ from agent.task_envelope import TaskEnvelope, build_shadow_envelope, validate_en
 
 @dataclass(frozen=True)
 class ModelCallShadow:
-    envelope: TaskEnvelope
+    envelope: TaskEnvelope | dict[str, Any]
     validation_errors: tuple[str, ...]
+
+    @property
+    def action_id(self) -> str:
+        if isinstance(self.envelope, TaskEnvelope):
+            return self.envelope.action_id
+        return ":".join(
+            str(self.envelope.get(field) or "")
+            for field in ("graph_id", "node_id", "attempt_id")
+        )
 
 
 _ResultT = TypeVar("_ResultT")
@@ -87,6 +96,20 @@ def _request_fingerprint_material(
     }
 
 
+def _active_phase2_envelope() -> dict[str, Any] | None:
+    try:
+        from agent.phase2_enforcement import current_sealed_envelope, is_enabled as phase2_enabled
+
+        if not phase2_enabled():
+            return None
+        envelope = current_sealed_envelope()
+        if envelope is None or envelope.get("execution_surface") != "direct_model":
+            return None
+        return dict(envelope)
+    except Exception:
+        return None
+
+
 def prepare_model_call_shadow(
     request: dict[str, Any],
     *,
@@ -106,6 +129,24 @@ def prepare_model_call_shadow(
         return request, None
 
     try:
+        authoritative = _active_phase2_envelope()
+        if authoritative is not None:
+            prepared = dict(request)
+            existing_headers = request.get("extra_headers")
+            headers = (
+                {
+                    name: value
+                    for name, value in existing_headers.items()
+                    if str(name).lower() != "x-request-id"
+                }
+                if isinstance(existing_headers, dict)
+                else {}
+            )
+            shadow = ModelCallShadow(envelope=authoritative, validation_errors=())
+            headers["x-request-id"] = shadow.action_id
+            prepared["extra_headers"] = headers
+            return prepared, shadow
+
         envelope = build_shadow_envelope(
             tool_name="model_call",
             args=_request_fingerprint_material(request, model=model, api_mode=api_mode),

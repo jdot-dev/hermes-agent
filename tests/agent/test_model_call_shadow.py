@@ -1,12 +1,14 @@
 from __future__ import annotations
 
+import json
 import sqlite3
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
 
-from agent import model_call_shadow
+from agent import model_call_shadow, phase2_enforcement
 from agent.action_receipts import ActionReceiptLedger
 from hermes_cli.config_defaults import DEFAULT_CONFIG
 from run_agent import AIAgent
@@ -286,6 +288,83 @@ def test_success_receipt_matches_injected_action_id_without_persisting_bodies(
     assert b"private prompt" not in db_bytes
     assert b"SENSITIVE_MARKER" not in db_bytes
     assert b"PRIVATE_API_KEY_MARKER" not in db_bytes
+
+
+def _sealed_model_envelope(tmp_path):
+    now = datetime.now(timezone.utc)
+    return {
+        "envelope_version": 2,
+        "graph_id": "g-model-receipt",
+        "node_id": "n-model-receipt",
+        "attempt_id": "at-model-receipt",
+        "idempotency_key": "e" * 64,
+        "objective": "record one authoritative model call",
+        "execution_surface": "direct_model",
+        "lane": "hermes",
+        "roots": [str(tmp_path)],
+        "permissions": {"read": [str(tmp_path)], "write": [], "spawn": []},
+        "network_policy": "none",
+        "exec_policy": "none",
+        "destructive_policy": "forbid",
+        "budgets": {"usd_max": 1.0, "tokens_max": 1000, "wall_clock_s_max": 60},
+        "deadline_utc": (now + timedelta(minutes=5)).isoformat(),
+        "retry_policy": {"max_attempts": 1, "retry_eligible": False, "backoff_s": [0]},
+        "cancellation": {"mode": "cooperative", "grace_s": 30},
+        "evidence_policy": {"required_receipt_kinds": ["model_call"], "min_receipts": 1},
+        "verifier_policy": {
+            "required": False,
+            "verifier_lane_must_differ": False,
+            "clean_workspace_required": False,
+        },
+        "planner_hash": "a" * 64,
+        "policy_hash": "b" * 64,
+        "input_hash": "c" * 64,
+        "lease": {
+            "holder": "hermes:test",
+            "granted_utc": now.isoformat(),
+            "ttl_s": 300,
+            "renewable": True,
+        },
+        "fence": 1,
+    }
+
+
+def test_flags_on_bound_direct_model_call_records_exact_sealed_v2(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_ENVELOPE_ENFORCE", "1")
+    db_path = tmp_path / "action_receipts.db"
+    monkeypatch.setattr(model_call_shadow, "default_db_path", lambda: db_path)
+    monkeypatch.setattr(
+        model_call_shadow,
+        "_load_config",
+        lambda: {"observability": {"envelope_shadow": {"enabled": True}}},
+    )
+    envelope = _sealed_model_envelope(tmp_path)
+    response = SimpleNamespace(
+        model="codex/gpt-5.6-sol-xhigh",
+        status="completed",
+        usage=SimpleNamespace(input_tokens=11, output_tokens=7, total_tokens=18),
+    )
+
+    with phase2_enforcement.bind_sealed_envelope(envelope, current_fence=1):
+        result = model_call_shadow.run_model_call_shadow(
+            {"model": "codex/gpt-5.6-sol-xhigh", "input": []},
+            lambda _prepared: response,
+            base_url="http://127.0.0.1:20128/v1",
+            provider="custom:omniroute-responses",
+            model="codex/gpt-5.6-sol-xhigh",
+            api_mode="codex_responses",
+            session_id="session-1",
+            task_id="task-1",
+            api_request_id="turn-1:api:sealed-v2",
+        )
+
+    rows = ActionReceiptLedger(db_path).read_all()
+    assert result is response
+    assert len(rows) == 1
+    assert rows[0]["kind"] == "model_call"
+    assert rows[0]["action_id"] == "g-model-receipt:n-model-receipt:at-model-receipt"
+    assert rows[0]["execution_surface"] == "direct_model"
+    assert json.loads(rows[0]["envelope_json"]) == envelope
 
 
 def test_provider_error_is_recorded_and_original_exception_is_raised(monkeypatch, tmp_path):

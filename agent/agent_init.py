@@ -1715,9 +1715,15 @@ def init_agent(
         agent._session_json_enabled = bool(_sess_cfg.get("write_json_snapshots", False))
     except Exception:
         pass
-    # logs_dir is retained unconditionally for request_dump_*.json (debug
-    # breadcrumb path written by agent_runtime_helpers.dump_api_request_debug).
-    
+    # Hermes-owned durable Phase 2 authority. Construct exactly one profile-scoped
+    # store per agent at startup; enforcement never manufactures authority lazily.
+    from agent.phase2_authority import Phase2AuthorityStore
+    from agent.phase2_enforcement import is_enabled as phase2_enforcement_enabled
+
+    agent.phase2_authority = Phase2AuthorityStore(hermes_home / "phase2_authority.db")
+    if phase2_enforcement_enabled():
+        agent.phase2_authority.recover()
+
     # Track conversation messages for session logging
     agent._session_messages: List[Dict[str, Any]] = []
     # Responses encrypted reasoning replay state.  Some OpenAI-compatible

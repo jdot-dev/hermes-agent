@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import sqlite3
 import threading
 from datetime import datetime, timedelta, timezone
 
@@ -236,6 +237,47 @@ def test_budget_reservation_reconciliation_is_durable_and_fail_closed(tmp_path):
         "cost_unknown": False,
     }
     reopened.reserve_budget(envelope, tokens=500, usd=0.5, now=now)
+
+
+def test_authority_startup_rejects_tampered_event_chain(tmp_path):
+    path = tmp_path / "authority.db"
+    store = Phase2AuthorityStore(path)
+    store.seal_plan(_plan(_node("n-tool")), policy_hash="d" * 64)
+    now = datetime(2026, 7, 30, tzinfo=timezone.utc)
+    store.grant_node(
+        "g-authority", "n-tool", holder="hermes:one", ttl_s=60, attempt_id="at-1", now=now
+    )
+    with sqlite3.connect(path) as conn:
+        conn.execute("DROP TRIGGER authority_events_no_update")
+        conn.execute("UPDATE authority_events SET payload_json = '{}' WHERE id = 1")
+
+    with pytest.raises(AuthorityError, match="hash chain"):
+        Phase2AuthorityStore(path).recover()
+
+
+def test_recovery_reconciles_orphaned_budget_reservation_exactly_once(tmp_path):
+    path = tmp_path / "authority.db"
+    store = Phase2AuthorityStore(path)
+    store.seal_plan(_plan(_node("n-tool")), policy_hash="d" * 64)
+    now = datetime(2026, 7, 30, tzinfo=timezone.utc)
+    envelope = store.grant_node(
+        "g-authority", "n-tool", holder="hermes:one", ttl_s=1, attempt_id="at-1", now=now
+    )
+    reservation = store.reserve_budget(envelope, tokens=100, usd=0.1, now=now)
+
+    recovered = Phase2AuthorityStore(path)
+    result = recovered.recover(now=now + timedelta(seconds=2))
+    assert result["orphaned_reservations_reconciled"] == 1
+    assert recovered.budget_usage("g-authority", "n-tool", fence=1) == {
+        "reserved_tokens": 0,
+        "reserved_usd": 0.0,
+        "charged_tokens": 0,
+        "charged_usd": 0.0,
+        "cost_unknown": True,
+    }
+    assert recovered.recover(now=now + timedelta(seconds=3))["orphaned_reservations_reconciled"] == 0
+    with pytest.raises(AuthorityError, match="already reconciled"):
+        recovered.reconcile_budget(reservation, actual_tokens=1, actual_usd=0.01)
 
 
 def test_unknown_reconciled_cost_poisons_future_reservations(tmp_path):

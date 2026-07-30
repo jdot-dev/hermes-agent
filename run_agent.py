@@ -427,6 +427,8 @@ class AIAgent:
     for AI models that support function calling.
     """
 
+    phase2_authority: Any
+
     _TOOL_CALL_ARGUMENTS_CORRUPTION_MARKER = (
         "[hermes-agent: tool call arguments were corrupted in this session and "
         "have been dropped to keep the conversation alive. See issue #15236.]"
@@ -616,6 +618,11 @@ class AIAgent:
             checkpoint_max_file_size_mb=checkpoint_max_file_size_mb,
             pass_session_id=pass_session_id,
         )
+
+    def bind_phase2_node(self, envelope, *, now=None):
+        """Bind one node only after the startup-owned durable store validates it."""
+
+        return self.phase2_authority.bind_current(envelope, now=now)
 
     def _get_session_db_for_recall(self):
         """Return a SessionDB for recall, lazily creating it if an entrypoint forgot.

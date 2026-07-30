@@ -34,6 +34,9 @@ _CURRENT_FENCE: ContextVar[int | None] = ContextVar("phase2_current_fence", defa
 _CURRENT_BUDGET: ContextVar[dict[str, Any] | None] = ContextVar(
     "phase2_current_budget", default=None
 )
+_CURRENT_DELEGATION: ContextVar[Any] = ContextVar(
+    "phase2_current_delegation", default=None
+)
 
 _REQUIRED_FIELDS = (
     "graph_id",
@@ -66,6 +69,12 @@ _ALLOWED_NETWORK = {"none", "loopback_only", "allowlist"}
 _ALLOWED_EXEC = {"none", "sandboxed", "host"}
 _ALLOWED_DESTRUCTIVE = {"forbid", "require_confirmation", "allow_within_roots"}
 _STATELESS_SURFACES = {"direct_model", "combo"}
+_MODEL_DISPATCH_TOOL = "__phase2_model_dispatch__"
+# Task-item keys a delegate request may carry. The list is closed: anything else
+# — a nested ``tasks`` array, an authority-shaped field, an unknown key — is
+# rejected rather than ignored, so one request can never describe two different
+# task sets.
+_ALLOWED_DELEGATE_TASK_KEYS = frozenset({"goal", "context", "role", "route"})
 _NETWORK_TOOLS = {
     "web_search",
     "web_extract",
@@ -159,15 +168,7 @@ def bind_sealed_envelope(
     frozen = MappingProxyType(deepcopy(dict(envelope)))
     envelope_token = _CURRENT_ENVELOPE.set(frozen)
     fence_token = _CURRENT_FENCE.set(current_fence)
-    budget_token = _CURRENT_BUDGET.set(
-        {
-            "usd": 0.0,
-            "tokens": 0,
-            "cost_unknown": False,
-            "started_monotonic": time.monotonic(),
-            "lock": threading.Lock(),
-        }
-    )
+    budget_token = _CURRENT_BUDGET.set(_new_budget_meter())
     try:
         yield
     finally:
@@ -192,22 +193,190 @@ def _action_id(envelope: Mapping[str, Any]) -> str:
     )
 
 
-def _delegate_requests(function_args: Mapping[str, Any]) -> list[Mapping[str, Any]]:
-    tasks = function_args.get("tasks")
-    if tasks is not None:
-        if not isinstance(tasks, list) or not tasks or not all(
-            isinstance(task, Mapping) for task in tasks
+def _new_budget_meter() -> dict[str, Any]:
+    return {
+        "usd": 0.0,
+        "tokens": 0,
+        "cost_unknown": False,
+        "started_monotonic": time.monotonic(),
+        "lock": threading.Lock(),
+    }
+
+
+class _DelegationScope:
+    """Resolve and bind a delegated child's execution nodes, server-side.
+
+    A delegation node (``a2a``/``acp_worker``) authorizes *dispatching* a child
+    and nothing else: contract v2 gives every graph node exactly one execution
+    surface, so an inference and each tool action it induces are separate nodes.
+    A child bound only to its delegation node can therefore perform no work at
+    all, and exempting it would hand it unsealed capability.
+
+    This scope closes that gap without weakening enforcement. On every execution
+    seam it (1) re-reads the child's own authority from the durable store, so a
+    revocation, expiry, completion, or fence bump lands immediately instead of
+    surviving on a context bound earlier, (2) resolves the separately sealed
+    descendant node that owns the surface the call needs — Hermes-side, through
+    immutable sealed edges, with no caller input — and (3) binds it as the
+    current authority so the receipt, idempotency claim, and budget meter all
+    belong to the node that actually performs the action.
+
+    Each descendant's budget meter is cached for the life of the child run:
+    rebinding a fresh meter per operation would reset consumption every time and
+    make the sealed per-node budget unenforceable.
+    """
+
+    def __init__(self, envelope: Mapping[str, Any], fence: int | None, store: Any) -> None:
+        self._envelope = envelope
+        self._fence = fence
+        self._store = store
+        self._surfaces: dict[str, dict[str, Any]] = {}
+        self._tokens: list[Any] = []
+
+    @property
+    def delegated_envelope(self) -> Mapping[str, Any]:
+        return self._envelope
+
+    def authorize(self, function_name: str, *, now: datetime) -> "EnforcementBlock | None":
+        surface = "direct_model" if function_name == _MODEL_DISPATCH_TOOL else "local_tool"
+        try:
+            errors = self._store.validate_current(self._envelope, now=now)
+        except Exception as exc:
+            return EnforcementBlock(
+                "delegated_authority_unavailable",
+                "The durable store could not re-check this delegated child's authority",
+                (str(exc),),
+            )
+        if errors:
+            return EnforcementBlock(
+                "delegated_authority_not_current",
+                "This delegated child's own sealed authority is no longer current",
+                tuple(errors),
+            )
+
+        entry = self._surfaces.get(surface)
+        if entry is None:
+            try:
+                descendant = self._store.resolve_execution_descendant(
+                    self._envelope, surface=surface, now=now
+                )
+                fence = self._store.current_fence(
+                    str(descendant["graph_id"]), str(descendant["node_id"])
+                )
+            except Exception as exc:
+                return EnforcementBlock(
+                    "execution_surface_unsealed",
+                    "A delegated child may only act through a separately sealed execution node",
+                    (surface, str(exc)),
+                )
+            if fence is None or descendant.get("fence") != fence:
+                return EnforcementBlock(
+                    "execution_authority_not_current",
+                    "The sealed execution node does not hold the authoritative current fence",
+                    (surface,),
+                )
+            entry = {
+                "envelope": MappingProxyType(deepcopy(dict(descendant))),
+                "fence": int(fence),
+                "budget": _new_budget_meter(),
+            }
+            self._surfaces[surface] = entry
+        else:
+            try:
+                descendant_errors = self._store.validate_current(
+                    entry["envelope"], now=now
+                )
+            except Exception as exc:
+                return EnforcementBlock(
+                    "execution_authority_unavailable",
+                    "The durable store could not re-check this execution node's authority",
+                    (surface, str(exc)),
+                )
+            if descendant_errors:
+                return EnforcementBlock(
+                    "execution_authority_not_current",
+                    "The sealed execution node's authority is no longer current",
+                    (surface, *descendant_errors),
+                )
+        self._bind(entry)
+        return None
+
+    def _bind(self, entry: Mapping[str, Any]) -> None:
+        first = not self._tokens
+        envelope_token = _CURRENT_ENVELOPE.set(entry["envelope"])
+        fence_token = _CURRENT_FENCE.set(entry["fence"])
+        budget_token = _CURRENT_BUDGET.set(entry["budget"])
+        if first:
+            # Only the first activation's tokens are kept: resetting them
+            # restores the delegation node itself, whatever was bound since.
+            self._tokens = [envelope_token, fence_token, budget_token]
+
+    def release(self) -> None:
+        if not self._tokens:
+            return
+        envelope_token, fence_token, budget_token = self._tokens
+        self._tokens = []
+        for variable, token in (
+            (_CURRENT_BUDGET, budget_token),
+            (_CURRENT_FENCE, fence_token),
+            (_CURRENT_ENVELOPE, envelope_token),
         ):
-            from agent.phase2_authority import AuthorityError
+            try:
+                variable.reset(token)
+            except ValueError:
+                # Activated from a different context (worker thread); that
+                # context's copy is discarded with the thread anyway.
+                pass
 
-            raise AuthorityError("delegate batch request is invalid")
-        return list(tasks)
-    goal = function_args.get("goal")
-    if not isinstance(goal, str) or not goal.strip():
-        from agent.phase2_authority import AuthorityError
 
-        raise AuthorityError("delegate child objective is required")
-    return [function_args]
+def _delegate_requests(function_args: Mapping[str, Any]) -> list[Mapping[str, Any]]:
+    """Normalize one delegate call into the single canonical batch shape.
+
+    Every delegation seam resolves child authority from *this* list and nothing
+    else, so a request can never carry a second, differently shaped task set
+    that selects a different grant than the one actually dispatched. Task items
+    are closed against :data:`_ALLOWED_DELEGATE_TASK_KEYS`: a nested ``tasks``
+    array, an authority-shaped field, or any unknown key is rejected outright.
+    """
+
+    from agent.phase2_authority import AuthorityError
+
+    tasks = function_args.get("tasks")
+    if tasks is None:
+        goal = function_args.get("goal")
+        if not isinstance(goal, str) or not goal.strip():
+            raise AuthorityError("delegate child objective is required")
+        tasks = [
+            {
+                key: function_args[key]
+                for key in sorted(_ALLOWED_DELEGATE_TASK_KEYS)
+                if function_args.get(key) is not None
+            }
+        ]
+    if not isinstance(tasks, list) or not tasks:
+        raise AuthorityError("delegate batch request is invalid")
+    requests: list[Mapping[str, Any]] = []
+    for index, task in enumerate(tasks):
+        if not isinstance(task, Mapping):
+            raise AuthorityError(f"delegate task {index} must be an object")
+        unknown = sorted(set(map(str, task)) - _ALLOWED_DELEGATE_TASK_KEYS)
+        if unknown:
+            raise AuthorityError(
+                f"delegate task {index} has unsupported field(s): {', '.join(unknown)}"
+            )
+        goal = task.get("goal")
+        if not isinstance(goal, str) or not goal.strip():
+            raise AuthorityError(f"delegate task {index} objective is required")
+        if task.get("role") is not None and task.get("role") not in {
+            "leaf",
+            "orchestrator",
+        }:
+            raise AuthorityError(f"delegate task {index} role is not recognized")
+        for field in ("context", "route"):
+            if task.get(field) is not None and not isinstance(task.get(field), str):
+                raise AuthorityError(f"delegate task {index} {field} must be a string")
+        requests.append(dict(task))
+    return requests
 
 
 def prepare_delegate_child_authority(
@@ -275,10 +444,24 @@ def bind_delegate_child_authority(
     The child never sees the parent's envelope, fence, or budget meter: the
     store re-validates the child's own grant and binds a fresh scope, so
     mutable parent authority cannot leak into the child's execution.
+
+    A :class:`_DelegationScope` is published alongside it so the child's model
+    dispatches and tool calls run under their own separately sealed execution
+    nodes, and so every one of those seams re-checks this child's durable
+    authority instead of trusting the binding done here.
     """
 
-    with _authority_store(store).bind_current(authority.envelope, now=now):
-        yield
+    authority_store = _authority_store(store)
+    with authority_store.bind_current(authority.envelope, now=now):
+        scope = _DelegationScope(
+            current_sealed_envelope(), current_authoritative_fence(), authority_store
+        )
+        scope_token = _CURRENT_DELEGATION.set(scope)
+        try:
+            yield
+        finally:
+            scope.release()
+            _CURRENT_DELEGATION.reset(scope_token)
 
 
 def _result_hash(result: Any) -> str:
@@ -865,6 +1048,17 @@ def evaluate_tool_call(
 
     if not is_enabled():
         return None
+    current = now or datetime.now(timezone.utc)
+    # Inside a delegated child, authority is re-derived here on every seam: the
+    # child's own grant is re-read from the durable store and the separately
+    # sealed node that owns this execution surface is resolved and bound. A
+    # child that was revoked, expired, or fenced out after binding is stopped at
+    # its next action instead of at result acceptance.
+    delegation = _CURRENT_DELEGATION.get()
+    if delegation is not None:
+        delegation_block = delegation.authorize(function_name, now=current)
+        if delegation_block is not None:
+            return delegation_block
     envelope = current_sealed_envelope()
     if envelope is None:
         return EnforcementBlock(
@@ -927,7 +1121,6 @@ def evaluate_tool_call(
             "The task-envelope fence is not the authoritative current fence",
         )
 
-    current = now or datetime.now(timezone.utc)
     deadline = _aware_datetime(envelope["deadline_utc"])
     assert deadline is not None
     if current >= deadline.astimezone(timezone.utc):
@@ -975,19 +1168,18 @@ def evaluate_tool_call(
             "Network execution remains blocked until every redirect hop and resolved address is re-authorized",
         )
     if function_name == "delegate_task":
-        tasks = function_args.get("tasks")
-        requests: list[Mapping[str, Any]]
-        if tasks is not None:
-            if not isinstance(tasks, list) or not tasks or not all(
-                isinstance(task, Mapping) for task in tasks
-            ):
-                return EnforcementBlock(
-                    "spawn_request_ambiguous",
-                    "Batch worker spawning requires a bounded list of task objects",
-                )
-            requests = list(tasks)
-        else:
-            requests = [function_args]
+        # One canonical request shape for both seams: the gate authorizes
+        # exactly the task list that ``delegate_task`` will dispatch children
+        # for, so no nested or unknown field can select a different grant here
+        # than the one that actually runs.
+        try:
+            requests = _delegate_requests(function_args)
+        except Exception as exc:
+            return EnforcementBlock(
+                "spawn_request_ambiguous",
+                "Batch worker spawning requires one canonical bounded list of task objects",
+                (str(exc),),
+            )
         targets: list[str] = []
         for request in requests:
             goal = request.get("goal")

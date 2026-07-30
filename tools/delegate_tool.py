@@ -2740,20 +2740,18 @@ def _delegate_task_impl(
     if not task_list:
         return tool_error("No tasks provided.")
 
-    # Authority is never an argument.  Every authority-shaped key is dropped
-    # from the request here, not just at the model-facing registry seam, so no
-    # caller — model, plugin, or direct Python — can name, mint, or select the
-    # grant a child runs under.  Children resolve from the sealed graph only.
-    task_list = [
-        {
-            key: value
-            for key, value in task.items()
-            if key not in _MODEL_HIDDEN_TASK_FIELDS
-        }
-        if isinstance(task, dict)
-        else task
-        for task in task_list
-    ]
+    # One canonical request shape, fixed before anything is resolved, reserved,
+    # or dispatched.  Task items are closed against _ALLOWED_TASK_KEYS: a nested
+    # 'tasks' array, an authority-shaped key, or any other unknown field is
+    # rejected outright rather than ignored, so a single request can never
+    # describe two different task sets — one that selects the sealed grants and
+    # another that names the goals children actually run.  Authority is never an
+    # argument: no caller — model, plugin, or direct Python — can name, mint, or
+    # select the grant a child runs under; children resolve from the sealed
+    # graph only.
+    task_list, shape_error = _canonical_task_list(task_list)
+    if shape_error:
+        return tool_error(shape_error)
 
     # With envelope enforcement enabled, resolve every child exclusively from
     # the sealed graph and reserve every allocation atomically before any worker
@@ -2765,7 +2763,7 @@ def _delegate_task_impl(
         try:
             child_authority_store = phase2_enforcement._authority_store()
             child_authorities = phase2_enforcement.prepare_delegate_child_authority(
-                {"tasks": task_list} if len(task_list) > 1 else task_list[0],
+                {"tasks": task_list},
                 store=child_authority_store,
             )
             child_settlement = phase2_enforcement.DelegateChildSettlement(
@@ -2773,6 +2771,17 @@ def _delegate_task_impl(
             )
             if _authority_box is not None:
                 _authority_box["settlement"] = child_settlement
+            # Fail closed on any arity drift between what was reserved and what
+            # will be dispatched.  A surplus grant would otherwise stay reserved
+            # against the parent's fence with no job to settle it, and a deficit
+            # would run a job with no sealed authority at all.  The settlement is
+            # already registered above, so the abort path terminally closes every
+            # child reserved a moment ago.
+            if len(child_authorities) != len(task_list):
+                raise RuntimeError(
+                    f"prepared {len(child_authorities)} sealed children for "
+                    f"{len(task_list)} dispatched tasks"
+                )
         except Exception as exc:
             return json.dumps(
                 phase2_enforcement.EnforcementBlock(
@@ -2782,15 +2791,6 @@ def _delegate_task_impl(
                 ).to_dict(),
                 ensure_ascii=False,
             )
-
-    # Validate each task has a goal
-    for i, task in enumerate(task_list):
-        if not isinstance(task, dict):
-            return tool_error(
-                f"Task {i} must be an object, got {type(task).__name__}."
-            )
-        if not task.get("goal", "").strip():
-            return tool_error(f"Task {i} is missing a 'goal'.")
 
     # Validate every route before resolving any credentials. This keeps a later
     # invalid batch item from triggering provider lookup, credential loading, or
@@ -4030,6 +4030,49 @@ _MODEL_HIDDEN_TASK_FIELDS = {
     "parent_action_id",
     "budget_reservation_id",
 }
+
+# The complete set of fields a delegate task item may carry.  Everything the
+# implementation reads off a task is here; anything else is a protocol error.
+_ALLOWED_TASK_KEYS = frozenset({"goal", "context", "role", "route"})
+
+
+def _canonical_task_list(
+    task_list: List[Any],
+) -> tuple[List[Dict[str, Any]], Optional[str]]:
+    """Return one canonical task list, or ``(_, error)`` if the request is not one.
+
+    Delegation resolves sealed child authority from the same list it dispatches
+    workers from, so the shape has to be decided exactly once, before either.
+    Unknown keys are rejected instead of dropped: a silently ignored nested
+    ``tasks`` array is precisely how a request can name one set of goals for
+    authority resolution and run a different set.
+    """
+
+    canonical: List[Dict[str, Any]] = []
+    for index, task in enumerate(task_list):
+        if not isinstance(task, dict):
+            return [], f"Task {index} must be an object, got {type(task).__name__}."
+        unknown = sorted(set(map(str, task)) - _ALLOWED_TASK_KEYS)
+        if unknown:
+            return [], (
+                f"Task {index} has unsupported field(s): {', '.join(unknown)}. "
+                f"Allowed fields: {', '.join(sorted(_ALLOWED_TASK_KEYS))}."
+            )
+        goal = task.get("goal")
+        if not isinstance(goal, str) or not goal.strip():
+            return [], f"Task {index} is missing a 'goal'."
+        role = task.get("role")
+        if role is not None and role not in ("leaf", "orchestrator"):
+            return [], (
+                f"Task {index} has an unrecognized role {role!r}; "
+                "expected 'leaf' or 'orchestrator'."
+            )
+        for field in ("context", "route"):
+            value = task.get(field)
+            if value is not None and not isinstance(value, str):
+                return [], f"Task {index} field '{field}' must be a string."
+        canonical.append(dict(task))
+    return canonical, None
 
 
 def _strip_model_hidden_task_fields(tasks: Any) -> Any:

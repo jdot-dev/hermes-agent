@@ -453,12 +453,25 @@ def test_every_authority_entry_point_fails_closed_on_a_violating_store(tmp_path)
     path = _legacy_duplicate_attempt_db(tmp_path)
     store = Phase2AuthorityStore(path)
     envelope = {"graph_id": "g-authority", "node_id": "n-one", "fence": 1, "attempt_id": "at-dup"}
+    # Resolving a delegated child's execution node is an authority-serving entry
+    # point too, so a quarantined store must refuse it rather than hand back a
+    # descendant nobody could have verified. Only a delegation-shaped envelope
+    # reaches the store: the surface guard runs before the first connect, and its
+    # plain AuthorityError would not satisfy the AuthorityMigrationRequired
+    # assertion below.
+    delegation = {**envelope, "execution_surface": "a2a"}
 
     for label, operation in (
         ("recover", lambda: store.recover(now=NOW)),
         ("current_fence", lambda: store.current_fence("g-authority", "n-one")),
         ("current_authority", lambda: store.current_authority("g-authority", "n-one")),
         ("validate_current", lambda: store.validate_current(envelope, now=NOW)),
+        (
+            "resolve_execution_descendant",
+            lambda: store.resolve_execution_descendant(
+                delegation, surface="direct_model", now=NOW
+            ),
+        ),
         ("get_planner_hash", lambda: store.get_planner_hash("g-authority")),
         ("budget_usage", lambda: store.budget_usage("g-authority", "n-one", fence=1)),
         ("seal_plan", lambda: store.seal_plan(_plan(), policy_hash="d" * 64, now=NOW)),

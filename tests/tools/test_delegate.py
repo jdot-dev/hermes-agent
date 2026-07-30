@@ -291,6 +291,320 @@ class TestStripBlockedTools(unittest.TestCase):
         )
 
 
+class TestDelegationDefaultToolsets(unittest.TestCase):
+    def _build(self, config, parent_enabled):
+        parent = _make_mock_parent()
+        parent.enabled_toolsets = parent_enabled
+        parent.disabled_toolsets = []
+        with (
+            patch("tools.delegate_tool._load_config", return_value=config),
+            patch("run_agent.AIAgent") as MockAgent,
+        ):
+            MockAgent.return_value = MagicMock()
+            _build_child_agent(
+                task_index=0,
+                goal="Inspect safely",
+                context=None,
+                toolsets=None,
+                model=None,
+                max_iterations=10,
+                parent_agent=parent,
+                task_count=1,
+                role="leaf",
+            )
+        return MockAgent.call_args.kwargs
+
+    def test_absent_config_preserves_parent_inheritance(self):
+        kwargs = self._build({}, ["terminal", "file", "web"])
+        self.assertEqual(kwargs["enabled_toolsets"], ["terminal", "file", "web"])
+
+    def test_configured_list_narrows_parent_capabilities(self):
+        kwargs = self._build(
+            {"default_toolsets": ["file"]},
+            ["terminal", "file", "web"],
+        )
+        self.assertEqual(kwargs["enabled_toolsets"], ["file"])
+
+    def test_configured_list_cannot_grant_unknown_or_blocked_toolsets(self):
+        kwargs = self._build(
+            {"default_toolsets": ["file", "not-a-toolset", "delegation", "memory"]},
+            ["terminal", "file", "web"],
+        )
+        self.assertEqual(kwargs["enabled_toolsets"], ["file"])
+        self.assertIn("delegation", kwargs["disabled_toolsets"])
+        self.assertIn("memory", kwargs["disabled_toolsets"])
+
+    def test_configured_list_preserves_parent_registered_dynamic_toolsets(self):
+        kwargs = self._build(
+            {"default_toolsets": ["file", "qmd"]},
+            ["terminal", "file", "web", "qmd"],
+        )
+        self.assertEqual(kwargs["enabled_toolsets"], ["file", "qmd"])
+
+    def test_invalid_config_type_preserves_parent_inheritance(self):
+        kwargs = self._build(
+            {"default_toolsets": "file"},
+            ["terminal", "file", "web"],
+        )
+        self.assertEqual(kwargs["enabled_toolsets"], ["terminal", "file", "web"])
+
+
+class TestDelegationRouteSchema(unittest.TestCase):
+    def test_routes_are_absent_when_operator_configures_none(self):
+        from tools.delegate_tool import _build_dynamic_schema_overrides
+
+        with patch("tools.delegate_tool._load_config", return_value={}):
+            props = _build_dynamic_schema_overrides()["parameters"]["properties"]
+        self.assertNotIn("route", props)
+        self.assertNotIn("route", props["tasks"]["items"]["properties"])
+
+    def test_routes_expose_only_operator_configured_names(self):
+        from tools.delegate_tool import _build_dynamic_schema_overrides
+
+        cfg = {
+            "routes": {
+                "local": {"model": "local-model"},
+                "hosted-fast": {"model": "hosted-model", "provider": "custom"},
+                "bad route": {"model": "must-not-appear"},
+                "not-a-map": "bad",
+            }
+        }
+        with patch("tools.delegate_tool._load_config", return_value=cfg):
+            props = _build_dynamic_schema_overrides()["parameters"]["properties"]
+        self.assertEqual(props["route"]["enum"], ["hosted-fast", "local"])
+        self.assertEqual(
+            props["tasks"]["items"]["properties"]["route"]["enum"],
+            ["hosted-fast", "local"],
+        )
+        self.assertNotIn("provider", props)
+        self.assertNotIn("model", props)
+        self.assertNotIn("base_url", props)
+        self.assertNotIn("api_key", props)
+        self.assertNotIn("api_mode", props)
+
+        # Dynamic schema assembly must not mutate the import-time schema or
+        # leak route names into sessions/configurations that do not define them.
+        with patch("tools.delegate_tool._load_config", return_value={}):
+            absent_props = _build_dynamic_schema_overrides()["parameters"]["properties"]
+        self.assertNotIn("route", absent_props)
+        self.assertNotIn(
+            "route", absent_props["tasks"]["items"]["properties"]
+        )
+
+
+class TestDelegationRoutes(unittest.TestCase):
+    @staticmethod
+    def _creds_for(cfg, _parent):
+        return {
+            "model": cfg.get("model"),
+            "provider": cfg.get("provider"),
+            "base_url": None,
+            "api_key": None,
+            "api_mode": None,
+            "request_overrides": None,
+            "max_output_tokens": None,
+            "command": None,
+            "args": [],
+        }
+
+    @patch("tools.delegate_tool._load_config")
+    @patch("tools.delegate_tool._resolve_delegation_credentials")
+    def test_batch_routes_each_child_through_named_operator_preset(
+        self, mock_creds, mock_cfg
+    ):
+        cfg = {
+            "model": "default-model",
+            "provider": "default-provider",
+            "max_iterations": 17,
+            "default_toolsets": ["file"],
+            "routes": {
+                "local": {"model": "local-model", "provider": "local-provider"},
+                "hosted": {"model": "hosted-model", "provider": "hosted-provider"},
+            },
+        }
+        mock_cfg.return_value = cfg
+        mock_creds.side_effect = self._creds_for
+        parent = _make_mock_parent()
+
+        with patch("run_agent.AIAgent") as MockAgent:
+            children = [MagicMock(), MagicMock()]
+            for child in children:
+                child.run_conversation.return_value = {
+                    "final_response": "done",
+                    "completed": True,
+                    "api_calls": 1,
+                }
+            MockAgent.side_effect = children
+            delegate_task(
+                tasks=[
+                    {"goal": "local work", "route": "local"},
+                    {"goal": "hosted work", "route": "hosted"},
+                ],
+                parent_agent=parent,
+            )
+
+        kwargs = [call.kwargs for call in MockAgent.call_args_list]
+        self.assertEqual([item["model"] for item in kwargs], ["local-model", "hosted-model"])
+        self.assertEqual(
+            [item["provider"] for item in kwargs],
+            ["local-provider", "hosted-provider"],
+        )
+        resolved_cfgs = [call.args[0] for call in mock_creds.call_args_list]
+        self.assertNotIn("routes", resolved_cfgs[0])
+        self.assertEqual(resolved_cfgs[0]["model"], "local-model")
+        self.assertEqual(resolved_cfgs[1]["model"], "hosted-model")
+        self.assertEqual(resolved_cfgs[0]["max_iterations"], 17)
+        self.assertEqual(resolved_cfgs[0]["default_toolsets"], ["file"])
+
+    def test_top_level_route_is_batch_fallback_only(self):
+        cfg = {
+            "routes": {
+                "local": {"model": "local-model", "provider": "local-provider"},
+                "hosted": {"model": "hosted-model", "provider": "hosted-provider"},
+            }
+        }
+        parent = _make_mock_parent()
+        with (
+            patch("tools.delegate_tool._load_config", return_value=cfg),
+            patch(
+                "tools.delegate_tool._resolve_delegation_credentials",
+                side_effect=self._creds_for,
+            ),
+            patch("run_agent.AIAgent") as MockAgent,
+        ):
+            children = [MagicMock(), MagicMock()]
+            for child in children:
+                child.run_conversation.return_value = {
+                    "final_response": "done", "completed": True, "api_calls": 1
+                }
+            MockAgent.side_effect = children
+            delegate_task(
+                tasks=[
+                    {"goal": "inherits fallback"},
+                    {"goal": "explicit local", "route": "local"},
+                ],
+                route="hosted",
+                parent_agent=parent,
+            )
+        kwargs = [call.kwargs for call in MockAgent.call_args_list]
+        self.assertEqual(
+            [item["model"] for item in kwargs],
+            ["hosted-model", "local-model"],
+        )
+
+    @patch("tools.delegate_tool._load_config")
+    @patch("tools.delegate_tool._resolve_delegation_credentials")
+    def test_unknown_route_fails_closed_before_credential_resolution(
+        self, mock_creds, mock_cfg
+    ):
+        mock_cfg.return_value = {
+            "routes": {"local": {"model": "local-model"}}
+        }
+        result = json.loads(
+            delegate_task(
+                tasks=[{"goal": "work", "route": "attacker/provider-model"}],
+                parent_agent=_make_mock_parent(),
+            )
+        )
+        self.assertIn("Unknown delegation route", result["error"])
+        self.assertIn("local", result["error"])
+        mock_creds.assert_not_called()
+
+    @patch("tools.delegate_tool._load_config")
+    @patch("tools.delegate_tool._resolve_delegation_credentials")
+    def test_later_unknown_route_fails_before_any_credential_resolution(
+        self, mock_creds, mock_cfg
+    ):
+        mock_cfg.return_value = {
+            "routes": {"local": {"model": "local-model"}}
+        }
+        result = json.loads(
+            delegate_task(
+                tasks=[
+                    {"goal": "valid first", "route": "local"},
+                    {"goal": "invalid second", "route": "attacker/provider-model"},
+                ],
+                parent_agent=_make_mock_parent(),
+            )
+        )
+        self.assertIn("Unknown delegation route", result["error"])
+        mock_creds.assert_not_called()
+
+    @patch("tools.delegate_tool._load_config")
+    @patch("tools.delegate_tool._resolve_delegation_credentials")
+    def test_absent_route_preserves_legacy_top_level_config(
+        self, mock_creds, mock_cfg
+    ):
+        cfg = {"model": "legacy-model", "provider": "legacy-provider"}
+        mock_cfg.return_value = cfg
+        mock_creds.side_effect = self._creds_for
+        parent = _make_mock_parent()
+        with patch("run_agent.AIAgent") as MockAgent:
+            child = MagicMock()
+            child.run_conversation.return_value = {
+                "final_response": "done", "completed": True, "api_calls": 1
+            }
+            MockAgent.return_value = child
+            delegate_task(goal="legacy work", parent_agent=parent)
+        self.assertEqual(MockAgent.call_args.kwargs["model"], "legacy-model")
+        self.assertEqual(MockAgent.call_args.kwargs["provider"], "legacy-provider")
+        self.assertEqual(mock_creds.call_count, 1)
+        self.assertIs(mock_creds.call_args.args[0], cfg)
+
+    @patch("tools.async_delegation.dispatch_async_delegation_batch")
+    @patch("tools.delegate_tool._load_config")
+    @patch("tools.delegate_tool._resolve_delegation_credentials")
+    def test_background_distinct_routes_same_model_report_mixed(
+        self, mock_creds, mock_cfg, mock_dispatch
+    ):
+        cfg = {
+            "routes": {
+                "local": {
+                    "model": "shared-model",
+                    "provider": "shared-provider",
+                    "base_url": "https://shared.example.invalid/v1",
+                },
+                "hosted": {
+                    "model": "shared-model",
+                    "provider": "shared-provider",
+                    "base_url": "https://shared.example.invalid/v1",
+                },
+            }
+        }
+        mock_cfg.return_value = cfg
+        mock_creds.side_effect = lambda route_cfg, _parent: {
+            "model": route_cfg.get("model"),
+            "provider": route_cfg.get("provider"),
+            "base_url": route_cfg.get("base_url"),
+            "api_key": None,
+            "api_mode": "chat_completions",
+            "request_overrides": None,
+            "max_output_tokens": None,
+            "command": None,
+            "args": [],
+        }
+        mock_dispatch.return_value = {
+            "status": "dispatched",
+            "delegation_id": "deleg-mixed",
+        }
+        parent = _make_mock_parent()
+        parent.session_id = "parent-session"
+        with patch("run_agent.AIAgent") as MockAgent:
+            MockAgent.side_effect = [MagicMock(), MagicMock()]
+            result = json.loads(
+                delegate_task(
+                    tasks=[
+                        {"goal": "local", "route": "local"},
+                        {"goal": "hosted", "route": "hosted"},
+                    ],
+                    background=True,
+                    parent_agent=parent,
+                )
+            )
+        self.assertEqual(result["status"], "dispatched")
+        self.assertEqual(mock_dispatch.call_args.kwargs["model"], "mixed")
+
+
 class TestDelegateTask(unittest.TestCase):
     def test_no_parent_agent(self):
         result = json.loads(delegate_task(goal="test"))

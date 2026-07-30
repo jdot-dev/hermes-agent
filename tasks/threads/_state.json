@@ -1,0 +1,9 @@
+{
+  "threads": {
+    "001-delegation-multiroute": {
+      "status": "reviewing",
+      "started_utc": "2026-07-30T01:10:16Z",
+      "summary": "Lean child schemas plus operator-owned multi-route delegation"
+    }
+  }
+}

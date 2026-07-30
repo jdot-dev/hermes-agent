@@ -49,11 +49,33 @@ NOW = datetime(2026, 7, 30, tzinfo=timezone.utc)
 # three are the dangerous ones: they compare or coerce close enough to an int to
 # reach the durable write, then change representation inside SQLite.
 MALFORMED_FENCES = [
-    ("1", "str", "'1'"),
-    (1.0, "float", "1.0"),
-    (True, "bool", "True"),
-    ([1], "list", "[1]"),
-    ({}, "dict", "{}"),
+    ("1", "str", "'1'", "not_an_integer"),
+    (1.0, "float", "1.0", "not_an_integer"),
+    (True, "bool", "True", "not_an_integer"),
+    ([1], "list", "[1]", "not_an_integer"),
+    ({}, "dict", "{}", "not_an_integer"),
+]
+
+# SQLite binds an INTEGER column as a signed 64-bit value. These four are the
+# extremes that still bind, so they must be treated as ordinary integer claims
+# and stored verbatim -- narrowing the accepted range would be a silent
+# availability bug, not a safety win.
+SIGNED64_MIN = -(2**63)
+SIGNED64_MAX = 2**63 - 1
+BINDABLE_FENCE_BOUNDS = [
+    ("lower", SIGNED64_MIN),
+    ("lower+1", SIGNED64_MIN + 1),
+    ("upper-1", SIGNED64_MAX - 1),
+    ("upper", SIGNED64_MAX),
+]
+
+# One past each end. The driver cannot bind these at all: pre-guard the INSERT
+# aborted with an untyped ``OverflowError`` raised from inside the transaction,
+# so the caller saw a driver error instead of a typed rejection and no audit row
+# survived. They are integers, so the reason must distinguish them from junk.
+OUT_OF_RANGE_FENCES = [
+    (SIGNED64_MAX + 1, "9223372036854775808"),
+    (SIGNED64_MIN - 1, "-9223372036854775809"),
 ]
 
 INTEGRITY_INDEXES = (
@@ -130,12 +152,63 @@ def _raw_rows(path) -> list[sqlite3.Row]:
         conn.close()
 
 
+def _durable_snapshot(path) -> dict[str, list[tuple]]:
+    """Every row of every user table -- the complete durable state of the store."""
+
+    conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+    try:
+        tables = [
+            row[0]
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' "
+                "AND name NOT LIKE 'sqlite_%' ORDER BY name"
+            )
+        ]
+        return {
+            table: conn.execute(f"SELECT * FROM {table} ORDER BY rowid").fetchall()
+            for table in tables
+        }
+    finally:
+        conn.close()
+
+
+def _assert_chain_intact(path) -> list[sqlite3.Row]:
+    """For every durable row, what SQLite hands back is what the hash covers."""
+
+    rows = _raw_rows(path)
+    previous_hash = None
+    for row in rows:
+        assert row["fence"] is None or (
+            isinstance(row["fence"], int) and not isinstance(row["fence"], bool)
+        )
+        assert isinstance(row["graph_id"], str)
+        assert row["node_id"] is None or isinstance(row["node_id"], str)
+        assert row["attempt_id"] is None or isinstance(row["attempt_id"], str)
+        recomputed = _canonical_hash(
+            {
+                "event_id": row["event_id"],
+                "ts_utc": row["ts_utc"],
+                "kind": row["kind"],
+                "graph_id": row["graph_id"],
+                "node_id": row["node_id"],
+                "attempt_id": row["attempt_id"],
+                "fence": row["fence"],
+                "payload": json.loads(row["payload_json"]),
+                "prev_event_hash": row["prev_event_hash"],
+            }
+        )
+        assert row["event_hash"] == recomputed
+        assert row["prev_event_hash"] == previous_hash
+        previous_hash = row["event_hash"]
+    return rows
+
+
 # ── Blocker 1: the persisted fence must be what the hash chain verifies ─────
 
 
-@pytest.mark.parametrize("bad_fence,type_name,repr_text", MALFORMED_FENCES)
+@pytest.mark.parametrize("bad_fence,type_name,repr_text,reason", MALFORMED_FENCES)
 def test_malformed_fence_completion_is_typed_and_leaves_chain_verifiable(
-    tmp_path, bad_fence, type_name, repr_text
+    tmp_path, bad_fence, type_name, repr_text, reason
 ):
     store = Phase2AuthorityStore(tmp_path / "a.db")
     envelope = _granted(store)
@@ -151,6 +224,7 @@ def test_malformed_fence_completion_is_typed_and_leaves_chain_verifiable(
     assert excinfo.value.result_hash == _sha("r")
     assert excinfo.value.claimed_fence_type == type_name
     assert excinfo.value.claimed_fence_repr == repr_text
+    assert excinfo.value.claimed_fence_reason == reason
 
     # The rejection is still auditable: exactly one typed RESULT_REJECTED.
     rejected = [e for e in store.read_events("g-authority") if e["kind"] == "RESULT_REJECTED"]
@@ -162,6 +236,7 @@ def test_malformed_fence_completion_is_typed_and_leaves_chain_verifiable(
     assert payload["claimed_fence"] is None
     assert payload["claimed_fence_type"] == type_name
     assert payload["claimed_fence_repr"] == repr_text
+    assert payload["claimed_fence_reason"] == reason
     # The authoritative fence is still recorded for reconciliation.
     assert payload["current_fence"] == 1
 
@@ -185,7 +260,7 @@ def test_malformed_fence_completion_is_typed_and_leaves_chain_verifiable(
     assert accepted["fence"] == 1
 
 
-@pytest.mark.parametrize("bad_fence", [value for value, _, _ in MALFORMED_FENCES])
+@pytest.mark.parametrize("bad_fence", [row[0] for row in MALFORMED_FENCES])
 def test_stored_fence_representation_equals_the_hashed_representation(tmp_path, bad_fence):
     # The invariant itself: for every durable row, the value SQLite hands back is
     # the value the event hash was computed over. Pre-fix, "1"/1.0/True were
@@ -199,30 +274,7 @@ def test_stored_fence_representation_equals_the_hashed_representation(tmp_path, 
             now=NOW + timedelta(seconds=5),
         )
 
-    previous_hash = None
-    for row in _raw_rows(store.db_path):
-        assert row["fence"] is None or (
-            isinstance(row["fence"], int) and not isinstance(row["fence"], bool)
-        )
-        assert isinstance(row["graph_id"], str)
-        assert row["node_id"] is None or isinstance(row["node_id"], str)
-        assert row["attempt_id"] is None or isinstance(row["attempt_id"], str)
-        recomputed = _canonical_hash(
-            {
-                "event_id": row["event_id"],
-                "ts_utc": row["ts_utc"],
-                "kind": row["kind"],
-                "graph_id": row["graph_id"],
-                "node_id": row["node_id"],
-                "attempt_id": row["attempt_id"],
-                "fence": row["fence"],
-                "payload": json.loads(row["payload_json"]),
-                "prev_event_hash": row["prev_event_hash"],
-            }
-        )
-        assert row["event_hash"] == recomputed
-        assert row["prev_event_hash"] == previous_hash
-        previous_hash = row["event_hash"]
+    _assert_chain_intact(store.db_path)
 
 
 @pytest.mark.parametrize("bad_fence", [1.0, True])
@@ -252,7 +304,7 @@ def test_repeated_malformed_rejections_keep_the_store_recoverable(tmp_path):
     # A hostile caller cannot brick the store by looping rejected completions.
     store = Phase2AuthorityStore(tmp_path / "a.db")
     envelope = _granted(store)
-    for index, (bad_fence, _, _) in enumerate(MALFORMED_FENCES):
+    for index, (bad_fence, _, _, _) in enumerate(MALFORMED_FENCES):
         with pytest.raises(MalformedEnvelopeFence):
             store.complete_node(
                 {**envelope, "fence": bad_fence},
@@ -273,6 +325,102 @@ def test_repeated_malformed_rejections_keep_the_store_recoverable(tmp_path):
     assert store.recover(now=NOW + timedelta(seconds=30)) == {
         "orphaned_reservations_reconciled": 0
     }
+
+
+@pytest.mark.parametrize(
+    "label,fence", BINDABLE_FENCE_BOUNDS, ids=[row[0] for row in BINDABLE_FENCE_BOUNDS]
+)
+def test_signed64_boundary_fences_are_ordinary_integer_claims(tmp_path, label, fence):
+    # The guard must reject only what cannot bind. Both extremes of the signed
+    # 64-bit range still bind, so they take the normal stale-fence path and are
+    # persisted verbatim -- refusing them would be a self-inflicted outage.
+    store = Phase2AuthorityStore(tmp_path / "a.db")
+    envelope = _granted(store)
+
+    with pytest.raises(ResultRejection) as excinfo:
+        store.complete_node(
+            {**envelope, "fence": fence},
+            result_hash=_sha("r"),
+            now=NOW + timedelta(seconds=5),
+        )
+    assert excinfo.value.reason == "stale_fence"
+    assert not isinstance(excinfo.value, MalformedEnvelopeFence)
+
+    rejected = [e for e in store.read_events("g-authority") if e["kind"] == "RESULT_REJECTED"]
+    assert len(rejected) == 1
+    assert rejected[0]["payload"]["claimed_fence"] == fence
+    assert rejected[0]["payload"]["claimed_fence_malformed"] is False
+    assert "claimed_fence_reason" not in rejected[0]["payload"]
+
+    # Stored verbatim: the exact int, not a coerced float or a truncation.
+    row = _assert_chain_intact(store.db_path)[-1]
+    assert row["fence"] == fence
+    assert isinstance(row["fence"], int) and not isinstance(row["fence"], bool)
+
+    assert store.recover(now=NOW + timedelta(seconds=10)) == {
+        "orphaned_reservations_reconciled": 0
+    }
+    assert Phase2AuthorityStore(tmp_path / "a.db").recover(
+        now=NOW + timedelta(seconds=10)
+    ) == {"orphaned_reservations_reconciled": 0}
+
+
+@pytest.mark.parametrize("fence,repr_text", OUT_OF_RANGE_FENCES)
+def test_out_of_range_fence_is_typed_and_never_reaches_the_driver(tmp_path, fence, repr_text):
+    # Establish the hazard against the real driver: this value genuinely cannot
+    # be bound, and unguarded it aborts the write with an untyped OverflowError.
+    probe = sqlite3.connect(":memory:")
+    try:
+        probe.execute("CREATE TABLE t(fence INTEGER)")
+        with pytest.raises(OverflowError):
+            probe.execute("INSERT INTO t(fence) VALUES (?)", (fence,))
+    finally:
+        probe.close()
+
+    store = Phase2AuthorityStore(tmp_path / "a.db")
+    envelope = _granted(store)
+
+    with pytest.raises(MalformedEnvelopeFence) as excinfo:
+        store.complete_node(
+            {**envelope, "fence": fence},
+            result_hash=_sha("r"),
+            now=NOW + timedelta(seconds=5),
+        )
+
+    # Typed, and specifically distinguished from junk: it *is* an integer.
+    error = excinfo.value
+    assert isinstance(error, ResultRejection)
+    assert error.reason == "malformed_fence"
+    assert error.claimed_fence_reason == "out_of_range"
+    assert error.claimed_fence_type == "int"
+    assert error.claimed_fence_repr == repr_text
+
+    # The audit row survives, with the unbindable claim normalized out of the
+    # indexed column and preserved losslessly in the payload.
+    rejected = [e for e in store.read_events("g-authority") if e["kind"] == "RESULT_REJECTED"]
+    assert len(rejected) == 1
+    payload = rejected[0]["payload"]
+    assert payload["claimed_fence"] is None
+    assert payload["claimed_fence_malformed"] is True
+    assert payload["claimed_fence_reason"] == "out_of_range"
+    assert payload["claimed_fence_repr"] == repr_text
+    assert payload["current_fence"] == 1
+    assert rejected[0]["fence"] is None
+
+    # No hash-chain damage, in this process and after restart.
+    _assert_chain_intact(store.db_path)
+    assert store.recover(now=NOW + timedelta(seconds=10)) == {
+        "orphaned_reservations_reconciled": 0
+    }
+    assert Phase2AuthorityStore(tmp_path / "a.db").recover(
+        now=NOW + timedelta(seconds=10)
+    ) == {"orphaned_reservations_reconciled": 0}
+
+    # The store still serves the legitimate holder afterwards.
+    accepted = store.complete_node(
+        envelope, result_hash=_sha("r"), now=NOW + timedelta(seconds=6)
+    )
+    assert accepted["fence"] == 1
 
 
 def test_append_event_refuses_column_types_that_do_not_round_trip(tmp_path):
@@ -300,12 +448,19 @@ def test_append_event_refuses_column_types_that_do_not_round_trip(tmp_path):
         ):
             with pytest.raises(AuthorityError, match=message):
                 store._append_event(conn, **{**base, field: value})
+        # An unbindable integer is a typed refusal too, and says which limit.
+        for value, _ in OUT_OF_RANGE_FENCES:
+            with pytest.raises(AuthorityError, match="signed 64-bit"):
+                store._append_event(conn, **{**base, "fence": value})
         # A non-serializable payload is a typed refusal, not a raw TypeError.
         with pytest.raises(AuthorityError, match="serializable"):
             store._append_event(conn, **{**base, "payload": {"bad": {1, 2}}})
         # Valid types still append.
         assert store._append_event(conn, **base).startswith("ev-")
         assert store._append_event(conn, **{**base, "fence": None, "node_id": None})
+        # Including both ends of the range the guard must not narrow.
+        for _, value in BINDABLE_FENCE_BOUNDS:
+            assert store._append_event(conn, **{**base, "fence": value}).startswith("ev-")
     finally:
         conn.close()
 
@@ -362,10 +517,10 @@ def _append_legacy_event(path, *, kind, node_id, attempt_id, fence, payload) -> 
         )
 
 
-def _legacy_duplicate_attempt_db(tmp_path):
+def _legacy_duplicate_attempt_db(tmp_path, *, db_name: str = "legacy-attempt.db"):
     """Prior base never bound attempt_id globally: same id granted on two nodes."""
 
-    path = tmp_path / "legacy-attempt.db"
+    path = tmp_path / db_name
     store = Phase2AuthorityStore(path)
     store.seal_plan(_plan(_node("n-one"), _node("n-two")), policy_hash="d" * 64)
     store.grant_node(
@@ -797,6 +952,72 @@ def test_reserve_budget_still_serves_the_real_holder(tmp_path):
     assert store.recover(now=NOW + timedelta(seconds=110)) == {
         "orphaned_reservations_reconciled": 0
     }
+
+
+# ── sealed plans must be finite before anything is persisted (v2 §9) ────────
+
+# Every numeric ceiling a sealed node carries. nan defeats each of them at
+# comparison time (``nan >= limit`` is False), and none of the three survives a
+# JSON round trip, so a sealed plan holding one is unauditable *and* unbounded.
+NON_FINITE = [("nan", float("nan")), ("+inf", float("inf")), ("-inf", float("-inf"))]
+SEALED_NUMERIC_KEYS = [
+    ("budgets", "usd_max"),
+    ("budgets", "tokens_max"),
+    ("budgets", "wall_clock_s_max"),
+    ("cancellation", "grace_s"),
+    ("retry_policy", "backoff_s"),
+]
+
+
+@pytest.mark.parametrize(
+    "group,key", SEALED_NUMERIC_KEYS, ids=[f"{g}.{k}" for g, k in SEALED_NUMERIC_KEYS]
+)
+@pytest.mark.parametrize("label,bad", NON_FINITE, ids=[label for label, _ in NON_FINITE])
+def test_sealed_plan_rejects_non_finite_numbers_before_persistence(
+    tmp_path, group, key, label, bad
+):
+    store = Phase2AuthorityStore(tmp_path / "a.db")
+    envelope = _granted(store)  # a real sealed plan and live lease to protect
+    before = _durable_snapshot(store.db_path)
+    assert before["sealed_plans"] and before["sealed_nodes"] and before["authority_events"]
+
+    node = _node("n-bad")
+    node[group] = {**node[group], key: [0, bad] if key == "backoff_s" else bad}
+
+    with pytest.raises(AuthorityError, match="finite"):
+        store.seal_plan(
+            {**_plan(node), "graph_id": "g-bad"}, policy_hash="e" * 64
+        )
+
+    # Nothing was written: not the plan, not its nodes, not an audit event.
+    assert _durable_snapshot(store.db_path) == before
+
+    # And the store is still fully authoritative afterwards.
+    assert store.recover(now=NOW + timedelta(seconds=10)) == {
+        "orphaned_reservations_reconciled": 0
+    }
+    accepted = store.complete_node(
+        envelope, result_hash=_sha("r"), now=NOW + timedelta(seconds=5)
+    )
+    assert accepted["fence"] == 1
+    _assert_chain_intact(store.db_path)
+
+
+@pytest.mark.parametrize("label,bad", NON_FINITE, ids=[label for label, _ in NON_FINITE])
+def test_sealed_plan_rejects_non_finite_numbers_outside_known_keys(tmp_path, label, bad):
+    # The guard is the canonical-JSON encoder, not a per-field allowlist, so an
+    # unrecognised numeric field cannot smuggle a non-finite value into the seal.
+    store = Phase2AuthorityStore(tmp_path / "a.db")
+    plan = {**_plan(_node("n-tool")), "graph_id": "g-bad", "operator_ceiling": bad}
+
+    with pytest.raises(AuthorityError, match="finite"):
+        store.seal_plan(plan, policy_hash="e" * 64)
+
+    # Validation precedes the first connect, so not even the file is created.
+    assert not (tmp_path / "a.db").exists()
+    # A clean plan still seals through the same path.
+    store.seal_plan(_plan(_node("n-tool")), policy_hash="d" * 64)
+    assert len(_durable_snapshot(store.db_path)["sealed_plans"]) == 1
 
 
 @pytest.mark.parametrize("bad", [float("nan"), float("inf")])

@@ -6,6 +6,7 @@ and it must never store a raw secret.
 """
 
 import sqlite3
+import json
 
 import pytest
 
@@ -68,6 +69,58 @@ def _record(ledger, **overrides):
     )
     fields.update(overrides)
     return ledger.record_receipt(**fields)
+
+
+def _sealed_v2_envelope():
+    return {
+        "envelope_version": 2,
+        "graph_id": "g-receipt",
+        "node_id": "n-tool",
+        "attempt_id": "at-1",
+        "idempotency_key": "d" * 64,
+        "objective": "record one sealed tool receipt",
+        "execution_surface": "local_tool",
+        "lane": "hermes",
+        "roots": ["/tmp"],
+        "permissions": {"read": ["/tmp"], "write": [], "spawn": []},
+        "network_policy": "none",
+        "exec_policy": "none",
+        "destructive_policy": "forbid",
+        "budgets": {"usd_max": 1.0, "tokens_max": 1000, "wall_clock_s_max": 60},
+        "deadline_utc": "2030-01-01T00:00:00+00:00",
+        "retry_policy": {"max_attempts": 1, "retry_eligible": False, "backoff_s": [0]},
+        "cancellation": {"mode": "cooperative", "grace_s": 30},
+        "evidence_policy": {"required_receipt_kinds": ["tool_exec"], "min_receipts": 1},
+        "verifier_policy": {
+            "required": False,
+            "verifier_lane_must_differ": False,
+            "clean_workspace_required": False,
+        },
+        "planner_hash": "a" * 64,
+        "policy_hash": "b" * 64,
+        "input_hash": "c" * 64,
+        "lease": {
+            "holder": "hermes:test",
+            "granted_utc": "2026-07-30T00:00:00+00:00",
+            "ttl_s": 300,
+            "renewable": True,
+        },
+        "fence": 1,
+    }
+
+
+def test_sealed_v2_mapping_is_recorded_without_reinterpreting_it_as_v1(ledger):
+    envelope = _sealed_v2_envelope()
+
+    _record(ledger, envelope=envelope)
+
+    row = ledger.read_all()[0]
+    stored = json.loads(row["envelope_json"])
+    assert stored == envelope
+    assert row["action_id"] == "g-receipt:n-tool:at-1"
+    assert row["execution_surface"] == "local_tool"
+    assert row["envelope_hash"] == action_receipts.canonical_hash(envelope)
+    assert ledger.verify_chain() == []
 
 
 def test_default_db_path_lives_in_hermes_home(monkeypatch, tmp_path):

@@ -23,7 +23,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from agent import action_receipts
+from agent import action_receipts, phase2_enforcement
 from run_agent import AIAgent
 
 
@@ -93,6 +93,47 @@ def _set_receipts_enabled(monkeypatch, enabled):
         "_load_config",
         lambda: {"observability": {"action_receipts": {"enabled": enabled}}},
     )
+
+
+def _sealed_v2_tool_envelope(root: Path) -> dict:
+    from datetime import datetime, timedelta, timezone
+
+    now = datetime.now(timezone.utc)
+    return {
+        "envelope_version": 2,
+        "graph_id": "g-receipt-seam",
+        "node_id": "n-tool",
+        "attempt_id": "at-1",
+        "idempotency_key": "d" * 64,
+        "objective": "receipt one authorized tool execution",
+        "execution_surface": "local_tool",
+        "lane": "hermes",
+        "roots": [str(root)],
+        "permissions": {"read": [str(root)], "write": [], "spawn": []},
+        "network_policy": "none",
+        "exec_policy": "none",
+        "destructive_policy": "forbid",
+        "budgets": {"usd_max": 1.0, "tokens_max": 1000, "wall_clock_s_max": 60},
+        "deadline_utc": (now + timedelta(minutes=5)).isoformat(),
+        "retry_policy": {"max_attempts": 1, "retry_eligible": False, "backoff_s": [0]},
+        "cancellation": {"mode": "cooperative", "grace_s": 30},
+        "evidence_policy": {"required_receipt_kinds": ["tool_exec"], "min_receipts": 1},
+        "verifier_policy": {
+            "required": False,
+            "verifier_lane_must_differ": False,
+            "clean_workspace_required": False,
+        },
+        "planner_hash": "a" * 64,
+        "policy_hash": "b" * 64,
+        "input_hash": "c" * 64,
+        "lease": {
+            "holder": "hermes:test",
+            "granted_utc": now.isoformat(),
+            "ttl_s": 300,
+            "renewable": True,
+        },
+        "fence": 1,
+    }
 
 
 def _receipts(db_path):
@@ -187,6 +228,27 @@ def test_enabled_sequential_writes_exactly_one_receipt_per_call(db_path, monkeyp
     assert all(r["envelope_hash"] and len(r["envelope_hash"]) == 64 for r in rows)
     # Tool results are untouched by instrumentation.
     assert [m["content"] for m in messages] == ["result-c1", "result-c2"]
+
+
+def test_bound_v2_authority_is_the_receipted_envelope(db_path, monkeypatch):
+    import json
+
+    _set_receipts_enabled(monkeypatch, True)
+    agent = _make_agent()
+    root = Path.cwd().resolve()
+
+    with phase2_enforcement.bind_sealed_envelope(
+        _sealed_v2_tool_envelope(root), current_fence=1
+    ):
+        _run_sequential(agent, [_tool_call(call_id="sealed-v2")], [])
+
+    row = _receipts(db_path)[0]
+    stored = json.loads(row["envelope_json"])
+    assert stored["envelope_version"] == 2
+    assert stored["graph_id"] == "g-receipt-seam"
+    assert stored["node_id"] == "n-tool"
+    assert stored["execution_surface"] == "local_tool"
+    assert row["action_id"] == "g-receipt-seam:n-tool:at-1"
 
 
 def test_receipt_hashes_raw_tool_output_before_guardrail_annotation(db_path, monkeypatch):

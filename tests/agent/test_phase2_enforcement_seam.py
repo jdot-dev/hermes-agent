@@ -106,13 +106,13 @@ def _enable(monkeypatch):
 def _envelope(root: Path, **overrides) -> dict:
     now = datetime.now(timezone.utc)
     envelope = {
-        "envelope_version": 1,
+        "envelope_version": 2,
         "graph_id": "g-phase2-seam",
         "node_id": "n-phase2-seam",
         "attempt_id": "at-phase2-seam",
         "idempotency_key": "d" * 64,
         "objective": "exercise both production tool dispatch seams",
-        "execution_surface": "direct_model",
+        "execution_surface": "local_tool",
         "lane": "hermes",
         "roots": [str(root)],
         "permissions": {"read": [str(root)], "write": [], "spawn": []},

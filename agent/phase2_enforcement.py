@@ -7,7 +7,9 @@ must bind an already-sealed envelope before enforcement can allow execution.
 
 from __future__ import annotations
 
+import hashlib
 import ipaddress
+import json
 import math
 import os
 import re
@@ -121,6 +123,33 @@ class EnforcementBlock:
         }
 
 
+@dataclass(frozen=True)
+class DelegateChildAuthority:
+    """One separately sealed child plus the parent's reserved allocation."""
+
+    envelope: Mapping[str, Any]
+    reservation_id: str
+    parent_action_id: str
+    child_action_id: str
+
+
+def _authority_store(store: Any = None) -> Any:
+    """Return the durable authority store used by every delegation seam.
+
+    ``phase2_authority`` imports from this module, so the class cannot be bound
+    at import time. Funnelling every construction through one function keeps the
+    lazy import in a single place and gives the dispatch seams (``delegate_task``
+    and ``evaluate_tool_call``) one store to agree on instead of each opening its
+    own connection to the default path.
+    """
+
+    if store is not None:
+        return store
+    from agent.phase2_authority import Phase2AuthorityStore
+
+    return Phase2AuthorityStore()
+
+
 @contextmanager
 def bind_sealed_envelope(
     envelope: Mapping[str, Any], *, current_fence: int | None = None
@@ -155,6 +184,346 @@ def current_authoritative_fence() -> int | None:
     """Return the fence bound by the Hermes control plane for this context."""
 
     return _CURRENT_FENCE.get()
+
+
+def _action_id(envelope: Mapping[str, Any]) -> str:
+    return ":".join(
+        str(envelope[field]) for field in ("graph_id", "node_id", "attempt_id")
+    )
+
+
+def _delegate_requests(function_args: Mapping[str, Any]) -> list[Mapping[str, Any]]:
+    tasks = function_args.get("tasks")
+    if tasks is not None:
+        if not isinstance(tasks, list) or not tasks or not all(
+            isinstance(task, Mapping) for task in tasks
+        ):
+            from agent.phase2_authority import AuthorityError
+
+            raise AuthorityError("delegate batch request is invalid")
+        return list(tasks)
+    goal = function_args.get("goal")
+    if not isinstance(goal, str) or not goal.strip():
+        from agent.phase2_authority import AuthorityError
+
+        raise AuthorityError("delegate child objective is required")
+    return [function_args]
+
+
+def prepare_delegate_child_authority(
+    function_args: Mapping[str, Any],
+    *,
+    child_envelopes: list[Mapping[str, Any]] | None = None,
+    store=None,
+    now: datetime | None = None,
+) -> list[DelegateChildAuthority]:
+    """Validate graph-bound children and reserve each allocation on the parent."""
+
+    from agent.phase2_authority import AuthorityError
+
+    parent = current_sealed_envelope()
+    if parent is None:
+        raise AuthorityError("missing current parent authority")
+    requests = _delegate_requests(function_args)
+    authority_store = _authority_store(store)
+    if child_envelopes is None:
+        resolved = authority_store.resolve_delegate_children(parent, requests, now=now)
+    else:
+        resolved = authority_store.validate_delegate_children(
+            parent, requests, child_envelopes, now=now
+        )
+    allocations: list[Mapping[str, Any]] = []
+    parent_action_id = _action_id(parent)
+    for child in resolved:
+        allocation = child["budgets"]
+        allocations.append(
+            {
+                "tokens": int(allocation["tokens_max"]),
+                "usd": float(allocation["usd_max"]),
+                "metadata": {
+                    "kind": "delegate_child_allocation",
+                    "parent_action_id": parent_action_id,
+                    "child_action_id": _action_id(child),
+                },
+            }
+        )
+    reservation_ids = authority_store.reserve_budget_allocations(
+        parent, allocations, now=now
+    )
+    prepared: list[DelegateChildAuthority] = []
+    for child, reservation_id in zip(resolved, reservation_ids):
+        prepared.append(
+            DelegateChildAuthority(
+                envelope=MappingProxyType(deepcopy(dict(child))),
+                reservation_id=reservation_id,
+                parent_action_id=parent_action_id,
+                child_action_id=_action_id(child),
+            )
+        )
+    return prepared
+
+
+@contextmanager
+def bind_delegate_child_authority(
+    authority: DelegateChildAuthority,
+    *,
+    store=None,
+    now: datetime | None = None,
+) -> Iterator[None]:
+    """Publish only the child's own current sealed authority to its run context.
+
+    The child never sees the parent's envelope, fence, or budget meter: the
+    store re-validates the child's own grant and binds a fresh scope, so
+    mutable parent authority cannot leak into the child's execution.
+    """
+
+    with _authority_store(store).bind_current(authority.envelope, now=now):
+        yield
+
+
+def _result_hash(result: Any) -> str:
+    encoded = json.dumps(
+        result, sort_keys=True, separators=(",", ":"), ensure_ascii=False, default=str
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def reconcile_delegate_child_authority(
+    authority: DelegateChildAuthority,
+    result: Any,
+    *,
+    actual_tokens: int,
+    actual_usd: float | None,
+    store=None,
+    now: datetime | None = None,
+) -> dict[str, Any]:
+    """Reconcile parent spend, then accept the exact child result once.
+
+    Spend is reconciled first so an accounted charge survives a rejected
+    acceptance: a stale, revoked, or wrong-fence child fails closed at
+    ``complete_node`` with the parent already debited for what it spent.
+    """
+
+    authority_store = _authority_store(store)
+    authority_store.reconcile_budget(
+        authority.reservation_id,
+        actual_tokens=actual_tokens,
+        actual_usd=actual_usd,
+        now=now,
+    )
+    return authority_store.complete_node(
+        authority.envelope,
+        result_hash=_result_hash(result),
+        now=now,
+    )
+
+
+def close_delegate_child_authority(
+    authority: DelegateChildAuthority,
+    *,
+    reason: str,
+    actual_tokens: int = 0,
+    actual_usd: float | None = None,
+    store=None,
+    now: datetime | None = None,
+) -> dict[str, Any]:
+    """Terminally close a child that must never be accepted as a success.
+
+    Failure, timeout, interruption, and cancellation all land here: the parent's
+    reservation is reconciled with whatever spend was observed (``None`` usd
+    poisons the parent's fence, which is the fail-closed reading of "the child
+    burned an unknowable amount"), then the child's lease is revoked so no later
+    delivery of its work can be completed against that fence.
+    """
+
+    authority_store = _authority_store(store)
+    detail: list[str] = []
+    try:
+        authority_store.reconcile_budget(
+            authority.reservation_id,
+            actual_tokens=actual_tokens,
+            actual_usd=actual_usd,
+            now=now,
+        )
+    except Exception as exc:  # already reconciled, or the fence moved
+        detail.append(f"reconcile: {exc}")
+    revoked = False
+    try:
+        authority_store.revoke_node(authority.envelope, now=now)
+        revoked = True
+    except Exception as exc:  # already revoked/completed, or superseded fence
+        detail.append(f"revoke: {exc}")
+    return {
+        "outcome": "revoked" if revoked else "already_closed",
+        "reason": reason,
+        "parent_action_id": authority.parent_action_id,
+        "child_action_id": authority.child_action_id,
+        "detail": "; ".join(detail) or None,
+    }
+
+
+class DelegateChildSettlement:
+    """Exactly-once terminal closure for every dispatched delegate child.
+
+    A dispatched child ends in exactly one of two states, and never both:
+
+    * **accepted** — its exact result reconciles the parent's reservation and
+      completes the child node once (idempotent on redelivery of the same
+      result), or
+    * **closed** — the reservation is reconciled with the observed spend and the
+      child's lease is revoked, so the outcome can never be replayed as success.
+
+    Both are safe to call concurrently from the worker thread that ran a child
+    and from the parent thread that abandoned it: the first caller claims the
+    index, later callers get ``already_settled``. Neither raises — a delegation
+    aggregation must not be destroyed by a bookkeeping failure — but every
+    failure is reported in the returned ``detail`` and never upgraded to a
+    success.
+    """
+
+    def __init__(
+        self,
+        authorities: Mapping[int, DelegateChildAuthority],
+        *,
+        store=None,
+    ) -> None:
+        self._authorities = dict(authorities)
+        self._store = _authority_store(store)
+        self._settled: dict[int, dict[str, Any]] = {}
+        self._lock = threading.Lock()
+
+    @property
+    def store(self) -> Any:
+        return self._store
+
+    def authority(self, index: int) -> DelegateChildAuthority | None:
+        return self._authorities.get(index)
+
+    def outcome(self, index: int) -> dict[str, Any] | None:
+        with self._lock:
+            settled = self._settled.get(index)
+            return dict(settled) if settled is not None else None
+
+    def _claim(self, index: int) -> DelegateChildAuthority | None:
+        with self._lock:
+            if index in self._settled:
+                return None
+            authority = self._authorities.get(index)
+            if authority is None:
+                return None
+            self._settled[index] = {
+                "outcome": "settling",
+                "parent_action_id": authority.parent_action_id,
+                "child_action_id": authority.child_action_id,
+                "detail": None,
+            }
+            return authority
+
+    def _record(self, index: int, outcome: dict[str, Any]) -> dict[str, Any]:
+        with self._lock:
+            self._settled[index] = dict(outcome)
+        return dict(outcome)
+
+    def _already(self, index: int) -> dict[str, Any]:
+        authority = self._authorities.get(index)
+        prior = self.outcome(index) or {}
+        return {
+            "outcome": "already_settled",
+            "prior_outcome": prior.get("outcome"),
+            "parent_action_id": getattr(authority, "parent_action_id", None),
+            "child_action_id": getattr(authority, "child_action_id", None),
+            "detail": prior.get("detail"),
+        }
+
+    def accept(
+        self,
+        index: int,
+        result: Any,
+        *,
+        actual_tokens: int,
+        actual_usd: float | None,
+        now: datetime | None = None,
+    ) -> dict[str, Any]:
+        """Accept one child's exact result; a rejection never becomes success."""
+
+        authority = self._claim(index)
+        if authority is None:
+            return self._already(index)
+        try:
+            accepted = reconcile_delegate_child_authority(
+                authority,
+                result,
+                actual_tokens=actual_tokens,
+                actual_usd=actual_usd,
+                store=self._store,
+                now=now,
+            )
+        except Exception as exc:
+            return self._record(
+                index,
+                {
+                    "outcome": "rejected",
+                    "parent_action_id": authority.parent_action_id,
+                    "child_action_id": authority.child_action_id,
+                    "detail": str(exc),
+                },
+            )
+        return self._record(
+            index,
+            {
+                "outcome": "accepted",
+                "idempotent": bool(accepted.get("idempotent")),
+                "parent_action_id": authority.parent_action_id,
+                "child_action_id": authority.child_action_id,
+                "detail": None,
+            },
+        )
+
+    def close(
+        self,
+        index: int,
+        *,
+        reason: str,
+        actual_tokens: int = 0,
+        actual_usd: float | None = None,
+        now: datetime | None = None,
+    ) -> dict[str, Any]:
+        """Close one child terminally without accepting its work."""
+
+        authority = self._claim(index)
+        if authority is None:
+            return self._already(index)
+        try:
+            closed = close_delegate_child_authority(
+                authority,
+                reason=reason,
+                actual_tokens=actual_tokens,
+                actual_usd=actual_usd,
+                store=self._store,
+                now=now,
+            )
+        except Exception as exc:
+            closed = {
+                "outcome": "close_failed",
+                "reason": reason,
+                "parent_action_id": authority.parent_action_id,
+                "child_action_id": authority.child_action_id,
+                "detail": str(exc),
+            }
+        return self._record(index, closed)
+
+    def close_remaining(
+        self, *, reason: str, now: datetime | None = None
+    ) -> list[dict[str, Any]]:
+        """Close every child that no path settled — abort, cancel, or crash."""
+
+        with self._lock:
+            pending = [
+                index for index in self._authorities if index not in self._settled
+            ]
+        return [
+            self.close(index, reason=reason, now=now) for index in sorted(pending)
+        ]
 
 
 def current_budget_usage() -> dict[str, float | int | bool] | None:
@@ -607,29 +976,47 @@ def evaluate_tool_call(
         )
     if function_name == "delegate_task":
         tasks = function_args.get("tasks")
+        requests: list[Mapping[str, Any]]
         if tasks is not None:
+            if not isinstance(tasks, list) or not tasks or not all(
+                isinstance(task, Mapping) for task in tasks
+            ):
+                return EnforcementBlock(
+                    "spawn_request_ambiguous",
+                    "Batch worker spawning requires a bounded list of task objects",
+                )
+            requests = list(tasks)
+        else:
+            requests = [function_args]
+        targets: list[str] = []
+        for request in requests:
+            goal = request.get("goal")
+            role = request.get("role") or function_args.get("role") or "leaf"
+            if not isinstance(goal, str) or not goal.strip() or role not in {
+                "leaf",
+                "orchestrator",
+            }:
+                return EnforcementBlock(
+                    "spawn_request_ambiguous",
+                    "Worker spawn request lacks one bounded goal and a recognized role",
+                )
+            target = f"delegate_task:{role}"
+            if target not in permissions["spawn"]:
+                return EnforcementBlock(
+                    "spawn_policy_denied",
+                    "Worker target is not authorized by the sealed envelope spawn list",
+                    (target,),
+                )
+            targets.append(target)
+        try:
+            _authority_store().resolve_delegate_children(envelope, requests, now=current)
+        except Exception as exc:
             return EnforcementBlock(
-                "spawn_request_ambiguous",
-                "Batch or nested worker spawning is not a single enforceable graph-node target",
+                "spawn_child_authority_not_enforceable",
+                "Worker spawning requires one current separately sealed child per graph edge",
+                (str(exc),),
             )
-        goal = function_args.get("goal")
-        role = function_args.get("role") or "leaf"
-        if not isinstance(goal, str) or not goal.strip() or role not in {"leaf", "orchestrator"}:
-            return EnforcementBlock(
-                "spawn_request_ambiguous",
-                "Worker spawn request lacks one bounded goal and a recognized role",
-            )
-        target = f"delegate_task:{role}"
-        if target not in permissions["spawn"]:
-            return EnforcementBlock(
-                "spawn_policy_denied",
-                "Worker target is not authorized by the sealed envelope spawn list",
-                (target,),
-            )
-        return EnforcementBlock(
-            "spawn_child_authority_not_enforceable",
-            "Worker spawning remains blocked until the child receives its own sealed envelope, fence, budget, and receipt identity",
-        )
+        return None
     if function_name == "terminal":
         if envelope["exec_policy"] == "none":
             return EnforcementBlock("exec_policy_denied", "Command execution is denied by the sealed envelope")

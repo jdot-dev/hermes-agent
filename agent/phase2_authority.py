@@ -300,6 +300,32 @@ def _nonnegative_number(value: Any, field: str) -> float:
     return float(value)
 
 
+def _normalized_reservation_metadata(
+    value: Any, field: str = "budget reservation metadata"
+) -> dict[str, Any] | None:
+    """Canonicalize optional reservation metadata, or fail closed typed.
+
+    Reservation metadata is the delegation seam's correlation record (which
+    parent action paid for which child action), so it lands in an append-only
+    payload that must be canonically serializable. Normalizing it *before* the
+    write transaction keeps a caller-supplied non-mapping or unserializable
+    value from surfacing as an untyped ``TypeError`` out of the middle of a
+    budget write, and mirrors the shared ``_append_event`` payload invariant.
+    An empty mapping carries no correlation and is dropped, so the payload of an
+    un-annotated reservation stays byte-identical to one made without metadata.
+    """
+
+    if value is None:
+        return None
+    if not isinstance(value, Mapping):
+        raise AuthorityError(f"{field} must be an object")
+    try:
+        normalized = json.loads(_canonical_json(value))
+    except (TypeError, ValueError) as exc:
+        raise AuthorityError(f"{field} is not canonically serializable") from exc
+    return normalized or None
+
+
 def _bounded_repr(value: Any) -> str:
     """Render an untrusted value as bounded, JSON-safe audit text."""
 
@@ -729,6 +755,118 @@ class Phase2AuthorityStore:
                 raise
             finally:
                 conn.close()
+
+    def resolve_delegate_children(
+        self,
+        parent_envelope: Mapping[str, Any],
+        requests: list[Mapping[str, Any]],
+        *,
+        now: datetime | None = None,
+    ) -> list[dict[str, Any]]:
+        """Resolve active child grants through immutable sealed graph edges."""
+
+        if not requests:
+            raise AuthorityError("delegate request count must be positive")
+        parent_errors = self.validate_current(parent_envelope, now=now)
+        if parent_errors:
+            raise AuthorityError(
+                "invalid current parent authority: " + ", ".join(parent_errors)
+            )
+        graph_id = str(parent_envelope.get("graph_id"))
+        parent_node_id = str(parent_envelope.get("node_id"))
+        conn = self._connect()
+        try:
+            row = conn.execute(
+                "SELECT plan_json FROM sealed_plans WHERE graph_id = ?", (graph_id,)
+            ).fetchone()
+            if row is None:
+                raise AuthorityError("unknown sealed parent graph")
+            plan = json.loads(row["plan_json"])
+            raw_edges = plan.get("edges")
+            if not isinstance(raw_edges, list):
+                raise AuthorityError("sealed plan has no delegate graph edges")
+            edges = [
+                edge
+                for edge in raw_edges
+                if isinstance(edge, Mapping)
+                and edge.get("dispatch_tool") == "delegate_task"
+                and edge.get("parent_node_id") == parent_node_id
+            ]
+            resolved: list[dict[str, Any]] = []
+            used_nodes: set[str] = set()
+            for request in requests:
+                goal = request.get("goal")
+                if not isinstance(goal, str) or not goal.strip():
+                    raise AuthorityError("delegate child objective is required")
+                matches: list[str] = []
+                for edge in edges:
+                    child_node_id = edge.get("child_node_id")
+                    if not isinstance(child_node_id, str) or child_node_id in used_nodes:
+                        continue
+                    node_row = conn.execute(
+                        "SELECT node_json FROM sealed_nodes WHERE graph_id = ? AND node_id = ?",
+                        (graph_id, child_node_id),
+                    ).fetchone()
+                    if node_row is None:
+                        continue
+                    node = json.loads(node_row["node_json"])
+                    if node.get("objective") == goal:
+                        matches.append(child_node_id)
+                if len(matches) != 1:
+                    raise AuthorityError(
+                        "delegate child edge/objective resolution must have exactly one match"
+                    )
+                child_node_id = matches[0]
+                authority = self._node_authority(conn, graph_id, child_node_id)
+                if authority is None:
+                    raise AuthorityError("delegate child has no active sealed authority")
+                child_envelope = authority["envelope"]
+                if child_envelope.get("execution_surface") not in {"a2a", "acp_worker"}:
+                    raise AuthorityError("delegate child execution surface is not enforceable")
+                used_nodes.add(child_node_id)
+                resolved.append(json.loads(_canonical_json(child_envelope)))
+        finally:
+            conn.close()
+        for child in resolved:
+            child_errors = self.validate_current(child, now=now)
+            if child_errors:
+                raise AuthorityError(
+                    "invalid current child envelope: " + ", ".join(child_errors)
+                )
+        return resolved
+
+    def validate_delegate_children(
+        self,
+        parent_envelope: Mapping[str, Any],
+        requests: list[Mapping[str, Any]],
+        child_envelopes: list[Mapping[str, Any]],
+        *,
+        now: datetime | None = None,
+    ) -> list[dict[str, Any]]:
+        """Validate explicit child grants against authoritative edge resolution.
+
+        The supplied envelopes are checked for their *own* currency first, so a
+        superseded, revoked, or expired grant fails with its specific lifecycle
+        reason (``stale_fence``, ``lease_revoked``, ...) instead of the generic
+        non-authoritative message. Only envelopes that are individually current
+        are then required to be byte-identical to the edge-resolved children.
+        """
+
+        if len(requests) != len(child_envelopes):
+            raise AuthorityError("delegate child envelope count does not match request count")
+        for supplied in child_envelopes:
+            if not isinstance(supplied, Mapping):
+                raise AuthorityError("delegate child envelope must be an object")
+            supplied_errors = self.validate_current(supplied, now=now)
+            if supplied_errors:
+                raise AuthorityError(
+                    "invalid current child envelope: " + ", ".join(supplied_errors)
+                )
+        resolved = self.resolve_delegate_children(parent_envelope, requests, now=now)
+        for supplied, authoritative in zip(child_envelopes, resolved):
+            if _canonical_json(dict(supplied)) != _canonical_json(authoritative):
+                raise AuthorityError("delegate child envelope is not authoritative")
+        return resolved
 
     @staticmethod
     def _load_plan_node(
@@ -1492,12 +1630,106 @@ class Phase2AuthorityStore:
             "cost_unknown": cost_unknown,
         }
 
+    def reserve_budget_allocations(
+        self,
+        envelope: Mapping[str, Any],
+        allocations: list[Mapping[str, Any]],
+        *,
+        now: datetime | None = None,
+    ) -> list[str]:
+        """Atomically reserve a bounded parent allocation for every child.
+
+        A fan-out allocation is an authoritative spend transition on the *parent*
+        node, so it is gated exactly like the single-reservation path: through
+        :meth:`_load_live_authority`, which binds holder and canonical envelope
+        identity on top of fence/attempt and refuses a revoked, terminal,
+        expired, or past-``deadline_utc`` node (contract §9). Gating a batch any
+        more weakly than a single reservation would make the delegation seam the
+        cheapest way to burn the real holder's budget — one call, N children.
+        """
+
+        if not allocations:
+            raise AuthorityError("budget allocations must be non-empty")
+        normalized: list[dict[str, Any]] = []
+        for allocation in allocations:
+            tokens = allocation.get("tokens")
+            if isinstance(tokens, bool) or not isinstance(tokens, int) or tokens < 0:
+                raise AuthorityError("tokens must be a non-negative integer")
+            usd = _nonnegative_number(allocation.get("usd"), "usd")
+            normalized.append(
+                {
+                    "tokens": tokens,
+                    "usd": usd,
+                    "metadata": _normalized_reservation_metadata(
+                        allocation.get("metadata"), "budget allocation metadata"
+                    ),
+                }
+            )
+        current = _utc(now)
+        with _DB_LOCK:
+            conn = self._connect()
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                graph_id, node_id, fence, latest_envelope = self._load_live_authority(
+                    conn, envelope, current, action="reserve budget"
+                )
+                state = self._budget_state(conn, graph_id, node_id, fence)
+                if state["cost_unknown"]:
+                    raise AuthorityError("budget cost is unknown")
+                limits = latest_envelope["budgets"]
+                tokens_total = sum(item["tokens"] for item in normalized)
+                usd_total = sum(item["usd"] for item in normalized)
+                # Same non-finite ceiling refusal as the single-reservation path:
+                # a legacy store sealed before that check could still hold
+                # ``tokens_max: inf``, where ``int(inf)`` aborts the fan-out with
+                # an untyped OverflowError instead of a typed, auditable refusal,
+                # and an unbreachable ceiling must never authorize spend. Gating
+                # the batch more weakly than a single reservation would make the
+                # delegation seam the cheapest way around the bound.
+                tokens_max = int(
+                    _nonnegative_number(limits.get("tokens_max"), "sealed budgets.tokens_max")
+                )
+                usd_max = _nonnegative_number(limits.get("usd_max"), "sealed budgets.usd_max")
+                if state["charged_tokens"] + state["reserved_tokens"] + tokens_total > tokens_max:
+                    raise AuthorityError("token budget reservation exceeds node budget")
+                if state["charged_usd"] + state["reserved_usd"] + usd_total > usd_max:
+                    raise AuthorityError("USD budget reservation exceeds node budget")
+                reservation_ids: list[str] = []
+                for item in normalized:
+                    reservation_id = f"res-{uuid.uuid4().hex}"
+                    payload = {"tokens": item["tokens"], "usd": item["usd"]}
+                    if item["metadata"] is not None:
+                        payload["metadata"] = item["metadata"]
+                    self._append_event(
+                        conn,
+                        kind="BUDGET_RESERVED",
+                        graph_id=graph_id,
+                        node_id=node_id,
+                        attempt_id=str(latest_envelope["attempt_id"]),
+                        fence=fence,
+                        payload=payload,
+                        now=current,
+                        event_id=reservation_id,
+                    )
+                    reservation_ids.append(reservation_id)
+                conn.execute("COMMIT")
+                return reservation_ids
+            except Exception:
+                try:
+                    conn.execute("ROLLBACK")
+                except Exception:
+                    pass
+                raise
+            finally:
+                conn.close()
+
     def reserve_budget(
         self,
         envelope: Mapping[str, Any],
         *,
         tokens: int,
         usd: float,
+        metadata: Mapping[str, Any] | None = None,
         now: datetime | None = None,
     ) -> str:
         """Reserve spend against the node budget under exact live authority.
@@ -1518,6 +1750,7 @@ class Phase2AuthorityStore:
         if isinstance(tokens, bool) or not isinstance(tokens, int) or tokens < 0:
             raise AuthorityError("tokens must be a non-negative integer")
         usd_value = _nonnegative_number(usd, "usd")
+        metadata_payload = _normalized_reservation_metadata(metadata)
         current = _utc(now)
         with _DB_LOCK:
             conn = self._connect()
@@ -1550,9 +1783,22 @@ class Phase2AuthorityStore:
                     kind="BUDGET_RESERVED",
                     graph_id=graph_id,
                     node_id=node_id,
+                    # Bind the authoritative attempt/fence returned by the live
+                    # authority gate, never the caller's claimed values: the
+                    # envelope is already proven byte-identical, and int() on a
+                    # claimed True/1.0 would coerce a non-canonical fence into a
+                    # plausible-looking row.
                     attempt_id=str(latest_envelope["attempt_id"]),
                     fence=fence,
-                    payload={"tokens": tokens, "usd": usd_value},
+                    payload={
+                        "tokens": tokens,
+                        "usd": usd_value,
+                        **(
+                            {"metadata": metadata_payload}
+                            if metadata_payload is not None
+                            else {}
+                        ),
+                    },
                     now=current,
                     event_id=reservation_id,
                 )
@@ -1591,12 +1837,19 @@ class Phase2AuthorityStore:
                 if reservation is None:
                     raise AuthorityError("unknown budget reservation")
                 duplicate = conn.execute(
-                    """SELECT 1 FROM authority_events
+                    """SELECT payload_json FROM authority_events
                        WHERE kind = 'BUDGET_RECONCILED'
                          AND json_extract(payload_json, '$.reservation_id') = ?""",
                     (reservation_id,),
                 ).fetchone()
                 if duplicate:
+                    prior = json.loads(duplicate["payload_json"])
+                    if (
+                        int(prior.get("actual_tokens", -1)) == actual_tokens
+                        and prior.get("actual_usd") == actual_usd
+                    ):
+                        conn.execute("COMMIT")
+                        return
                     raise AuthorityError("budget reservation already reconciled")
                 self._append_event(
                     conn,

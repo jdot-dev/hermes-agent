@@ -1809,17 +1809,146 @@ def _apply_summary_budget(results: List[Dict[str, Any]], parent_agent) -> None:
         )
 
 
+def _child_observed_usage(child) -> tuple[int, Optional[float]]:
+    """Observed child spend for reconciliation.
+
+    Returns ``(tokens, usd)``.  ``usd`` is ``None`` when the child cannot
+    report a real number — an abandoned, wedged, or mock child.  Unknown cost
+    is not zero cost: it poisons the parent's fence so nothing further can be
+    reserved against a spend nobody can account for.
+    """
+    tokens = 0
+    for attr in ("session_prompt_tokens", "session_completion_tokens"):
+        value = getattr(child, attr, 0)
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            tokens += max(0, int(value))
+    cost = getattr(child, "session_estimated_cost_usd", None)
+    if isinstance(cost, bool) or not isinstance(cost, (int, float)) or cost < 0:
+        return tokens, None
+    return tokens, float(cost)
+
+
+def _child_authority_result(entry: Dict[str, Any]) -> Dict[str, Any]:
+    """The exact, stable child outcome identity that acceptance is hashed over.
+
+    Only fields the child actually determined — no wall clock, no paths, no
+    parent-side annotations — so redelivering the same result reconciles
+    idempotently instead of minting a second acceptance.
+    """
+    return {
+        "task_index": entry.get("task_index"),
+        "status": entry.get("status"),
+        "exit_reason": entry.get("exit_reason"),
+        "summary": entry.get("summary"),
+        "api_calls": entry.get("api_calls"),
+    }
+
+
+def _settle_child_entry(entry: Dict[str, Any], settlement, task_index: int, child) -> Dict[str, Any]:
+    """Close one child's sealed authority from its observed outcome, once.
+
+    A completed child is accepted against its own node; anything else
+    (failed/error/timeout/interrupted) is terminally revoked without acceptance.
+    An acceptance the store rejects — stale attempt, revoked lease, superseded
+    fence — downgrades the entry: the parent never reports success the control
+    plane refused.
+
+    ``already_settled`` is only a success when the prior settlement was itself
+    an acceptance.  A worker that finishes after the parent abandoned it loses
+    the claim to a revocation, and its late "completed" must not be reported as
+    a success the control plane already closed.
+    """
+    if settlement is None or settlement.authority(task_index) is None:
+        return entry
+    tokens, usd = _child_observed_usage(child)
+    if entry.get("status") == "completed":
+        outcome = settlement.accept(
+            task_index,
+            _child_authority_result(entry),
+            actual_tokens=tokens,
+            actual_usd=usd,
+        )
+        settled = outcome.get("outcome")
+        accepted = settled == "accepted" or (
+            settled == "already_settled" and outcome.get("prior_outcome") == "accepted"
+        )
+        if not accepted:
+            entry["status"] = "failed"
+            entry["exit_reason"] = "authority_rejected"
+            entry["error"] = (
+                "Subagent result was not accepted by its sealed authority: "
+                f"{outcome.get('detail') or outcome.get('prior_outcome') or settled}"
+            )
+    else:
+        outcome = settlement.close(
+            task_index,
+            reason=str(entry.get("status") or "failed"),
+            actual_tokens=tokens,
+            actual_usd=usd,
+        )
+    entry["parent_action_id"] = outcome.get("parent_action_id")
+    entry["child_action_id"] = outcome.get("child_action_id")
+    entry["authority_outcome"] = outcome.get("outcome")
+    return entry
+
+
 def _run_single_child(
     task_index: int,
     goal: str,
     child=None,
     parent_agent=None,
+    settlement=None,
+    **_kwargs,
+) -> Dict[str, Any]:
+    """Run one pre-built child and settle its sealed authority exactly once.
+
+    The settlement wrapper lives outside ``_run_child_conversation`` so that
+    every exit — normal return, timeout, or an escaping exception — terminally
+    closes the child.  A child that is never accepted here can never be
+    accepted later.
+    """
+    if child is None or parent_agent is None:
+        raise ValueError("child and parent_agent are required")
+
+    child_authority = settlement.authority(task_index) if settlement is not None else None
+    child_authority_store = settlement.store if settlement is not None else None
+    try:
+        entry = _run_child_conversation(
+            task_index,
+            goal,
+            child=child,
+            parent_agent=parent_agent,
+            child_authority=child_authority,
+            child_authority_store=child_authority_store,
+        )
+    except BaseException:
+        if settlement is not None:
+            settlement.close(
+                task_index,
+                reason="child_raised",
+                actual_tokens=_child_observed_usage(child)[0],
+                actual_usd=None,
+            )
+        raise
+    return _settle_child_entry(entry, settlement, task_index, child)
+
+
+def _run_child_conversation(
+    task_index: int,
+    goal: str,
+    child=None,
+    parent_agent=None,
+    child_authority=None,
+    child_authority_store=None,
     **_kwargs,
 ) -> Dict[str, Any]:
     """
     Run a pre-built child agent. Called from within a thread.
     Returns a structured result dict.
     """
+    if child is None or parent_agent is None:
+        raise ValueError("child and parent_agent are required")
+
     child_start = time.monotonic()
 
     # Get the progress callback from the child agent
@@ -2021,13 +2150,29 @@ def _run_single_child(
             except Exception as e:
                 logger.debug("Child text relay failed: %s", e)
 
-        def _run_with_thread_capture():
-            _worker_thread_holder["t"] = threading.current_thread()
+        def _run_conversation():
             return child.run_conversation(
                 user_message=goal,
                 task_id=child_task_id,
                 stream_callback=_relay_child_text,
             )
+
+        def _run_with_thread_capture():
+            _worker_thread_holder["t"] = threading.current_thread()
+            if child_authority is None:
+                return _run_conversation()
+            # Bind here, on the thread that actually runs the conversation:
+            # ContextVars do not cross a thread boundary, so binding in the
+            # caller would leave the child running under whatever authority
+            # (parent's, or none) this worker thread started with.  The bind
+            # re-validates the child's own current grant and installs a fresh
+            # fence and budget meter — the child never inherits the parent's.
+            from agent import phase2_enforcement as _p2e
+
+            with _p2e.bind_delegate_child_authority(
+                child_authority, store=child_authority_store
+            ):
+                return _run_conversation()
 
         _child_future = _timeout_executor.submit(_run_with_thread_capture)
         try:
@@ -2470,6 +2615,46 @@ def delegate_task(
 
     Returns JSON with results array, one entry per task.
     """
+    # Authority backstop.  Child allocations are reserved on the parent's fence
+    # before any worker is built, so every path out of the implementation that
+    # does *not* hand the batch to a runner — an early tool_error, a raising
+    # child build, an interrupt — must terminally close the children it
+    # reserved.  The background path releases ownership explicitly, because its
+    # children outlive this call and settle on the daemon thread.
+    authority_box: Dict[str, Any] = {}
+    try:
+        return _delegate_task_impl(
+            goal=goal,
+            context=context,
+            tasks=tasks,
+            max_iterations=max_iterations,
+            role=role,
+            route=route,
+            background=background,
+            parent_agent=parent_agent,
+            _authority_box=authority_box,
+        )
+    finally:
+        settlement = authority_box.get("settlement")
+        if settlement is not None and not authority_box.get("released"):
+            try:
+                settlement.close_remaining(reason="delegation_aborted")
+            except Exception:
+                logger.debug("Delegate child authority abort-close failed", exc_info=True)
+
+
+def _delegate_task_impl(
+    goal: Optional[str] = None,
+    context: Optional[str] = None,
+    tasks: Optional[List[Dict[str, Any]]] = None,
+    max_iterations: Optional[int] = None,
+    role: Optional[str] = None,
+    route: Optional[str] = None,
+    background: Optional[bool] = None,
+    parent_agent=None,
+    _authority_box: Optional[Dict[str, Any]] = None,
+) -> str:
+    """Body of :func:`delegate_task`; see there for the caller contract."""
     if parent_agent is None:
         return tool_error("delegate_task requires a parent agent context.")
 
@@ -2554,6 +2739,49 @@ def delegate_task(
 
     if not task_list:
         return tool_error("No tasks provided.")
+
+    # Authority is never an argument.  Every authority-shaped key is dropped
+    # from the request here, not just at the model-facing registry seam, so no
+    # caller — model, plugin, or direct Python — can name, mint, or select the
+    # grant a child runs under.  Children resolve from the sealed graph only.
+    task_list = [
+        {
+            key: value
+            for key, value in task.items()
+            if key not in _MODEL_HIDDEN_TASK_FIELDS
+        }
+        if isinstance(task, dict)
+        else task
+        for task in task_list
+    ]
+
+    # With envelope enforcement enabled, resolve every child exclusively from
+    # the sealed graph and reserve every allocation atomically before any worker
+    # is constructed.  The resulting objects are internal-only.
+    child_settlement = None
+    from agent import phase2_enforcement
+
+    if phase2_enforcement.is_enabled():
+        try:
+            child_authority_store = phase2_enforcement._authority_store()
+            child_authorities = phase2_enforcement.prepare_delegate_child_authority(
+                {"tasks": task_list} if len(task_list) > 1 else task_list[0],
+                store=child_authority_store,
+            )
+            child_settlement = phase2_enforcement.DelegateChildSettlement(
+                dict(enumerate(child_authorities)), store=child_authority_store
+            )
+            if _authority_box is not None:
+                _authority_box["settlement"] = child_settlement
+        except Exception as exc:
+            return json.dumps(
+                phase2_enforcement.EnforcementBlock(
+                    "missing_child_authority",
+                    "Delegation is blocked until every worker has graph-bound sealed authority",
+                    (str(exc),),
+                ).to_dict(),
+                ensure_ascii=False,
+            )
 
     # Validate each task has a goal
     for i, task in enumerate(task_list):
@@ -2680,7 +2908,9 @@ def delegate_task(
         if n_tasks == 1:
             # Single task -- run directly (no thread pool overhead)
             _i, _t, child = children[0]
-            result = _run_single_child(_i, _t["goal"], child, parent_agent)
+            result = _run_single_child(
+                _i, _t["goal"], child, parent_agent, settlement=child_settlement
+            )
             results.append(result)
         else:
             # Batch -- run in parallel with per-task progress lines
@@ -2700,6 +2930,7 @@ def delegate_task(
                         goal=t["goal"],
                         child=child,
                         parent_agent=parent_agent,
+                        settlement=child_settlement,
                     )
                     futures[future] = i
 
@@ -2747,6 +2978,28 @@ def delegate_task(
                                         _child_by_index.get(idx), "_delegate_role", None
                                     ),
                                 }
+                                # Revoke now rather than waiting on the
+                                # abandoned worker: the child keeps running on a
+                                # daemon thread and may finish after we stop
+                                # looking.  Closing its lease here means that
+                                # late work can never be accepted as a success
+                                # the parent already reported as interrupted.
+                                if child_settlement is not None:
+                                    _closed = child_settlement.close(
+                                        idx,
+                                        reason="parent_interrupted",
+                                        actual_tokens=_child_observed_usage(
+                                            _child_by_index.get(idx)
+                                        )[0],
+                                        actual_usd=None,
+                                    )
+                                    entry["parent_action_id"] = _closed.get(
+                                        "parent_action_id"
+                                    )
+                                    entry["child_action_id"] = _closed.get(
+                                        "child_action_id"
+                                    )
+                                    entry["authority_outcome"] = _closed.get("outcome")
                             results.append(entry)
                             completed_count += 1
                         break
@@ -3028,7 +3281,16 @@ def delegate_task(
                     pass
 
         def _batch_runner():
-            return _execute_and_aggregate()
+            # The same sealed child identities travel into background
+            # finalization through this closure: each child is accepted or
+            # revoked against its own node on the daemon thread, before the
+            # consolidated completion event is pushed.
+            try:
+                return _execute_and_aggregate()
+            except BaseException:
+                if child_settlement is not None:
+                    child_settlement.close_remaining(reason="background_batch_failed")
+                raise
 
         def _batch_interrupt():
             for _c in _child_agents:
@@ -3039,6 +3301,16 @@ def delegate_task(
                         _c._interrupt_requested = True
                 except Exception:
                     pass
+            # Cancellation is terminal for authority even though the daemon
+            # threads may still be unwinding: revoke every child that has not
+            # already settled so none of them can land as a success.
+            if child_settlement is not None:
+                try:
+                    child_settlement.close_remaining(reason="async_cancelled")
+                except Exception:
+                    logger.debug(
+                        "Delegate child authority cancel-close failed", exc_info=True
+                    )
 
         _goals = [t["goal"] for t in task_list]
         _route_identities = [
@@ -3076,6 +3348,11 @@ def delegate_task(
         )
 
         if dispatch.get("status") == "dispatched":
+            # Ownership of every child's settlement moves to _batch_runner /
+            # _batch_interrupt now; the caller-side backstop must not close
+            # children that are legitimately still running in the background.
+            if _authority_box is not None:
+                _authority_box["released"] = True
             n = len(_goals)
             note = (
                 "Subagent is running in the background. You and the user can "
@@ -3746,7 +4023,13 @@ def _model_background_value(args: dict, parent_agent=None) -> bool:
     return not is_subagent
 
 
-_MODEL_HIDDEN_TASK_FIELDS = {"acp_command", "acp_args"}
+_MODEL_HIDDEN_TASK_FIELDS = {
+    "acp_command",
+    "acp_args",
+    "child_envelope",
+    "parent_action_id",
+    "budget_reservation_id",
+}
 
 
 def _strip_model_hidden_task_fields(tasks: Any) -> Any:

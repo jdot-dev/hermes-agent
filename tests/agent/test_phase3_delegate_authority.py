@@ -12,9 +12,13 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import tempfile
 import threading
 import time
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -39,7 +43,14 @@ def _hex(seed: str) -> str:
     return (seed * 64)[:64]
 
 
-def _node(node_id: str, *, surface: str, goal: str | None = None) -> dict:
+def _node(
+    node_id: str,
+    *,
+    surface: str,
+    goal: str | None = None,
+    roots: list[str] | None = None,
+    budgets: dict | None = None,
+) -> dict:
     is_parent = node_id == "parent"
     return {
         "node_id": node_id,
@@ -47,16 +58,17 @@ def _node(node_id: str, *, surface: str, goal: str | None = None) -> dict:
         "idempotency_key": _hex("a" if is_parent else "b"),
         "execution_surface": surface,
         "lane": "hermes" if is_parent else "claude_opus",
-        "roots": ["/tmp"],
+        "roots": roots or ["/tmp"],
         "permissions": {
-            "read": ["/tmp"],
+            "read": roots or ["/tmp"],
             "write": [],
             "spawn": ["delegate_task:leaf"] if is_parent else [],
         },
         "network_policy": "none",
         "exec_policy": "none",
         "destructive_policy": "forbid",
-        "budgets": (
+        "budgets": budgets
+        or (
             {"usd_max": 10.0, "tokens_max": 10000, "wall_clock_s_max": 600}
             if is_parent
             else {"usd_max": 1.0, "tokens_max": 1000, "wall_clock_s_max": 60}
@@ -74,11 +86,61 @@ def _node(node_id: str, *, surface: str, goal: str | None = None) -> dict:
     }
 
 
-def _authority(tmp_path, *, goals: tuple[str, ...] = (CHILD_GOAL,)):
-    """Seal a parent with one delegate edge per goal and grant every node."""
+# One execution surface per graph node (contract v2 §4): the a2a delegation node
+# authorizes the dispatch, and the inferences and tool actions the child then
+# performs run under these separately sealed descendants.
+_EXECUTION_DESCENDANTS = (
+    ("model", "direct_model", "__phase2_model_dispatch__"),
+    ("tool", "local_tool", "__phase2_local_tool__"),
+)
+
+
+def _descendant_nodes(child_id: str, *, roots: list[str] | None = None) -> list[dict]:
+    return [
+        _node(
+            f"{child_id}-{suffix}",
+            surface=surface,
+            goal=f"{child_id} {surface} work",
+            roots=roots,
+            budgets={"usd_max": 0.5, "tokens_max": 500, "wall_clock_s_max": 30},
+        )
+        for suffix, surface, _tool in _EXECUTION_DESCENDANTS
+    ]
+
+
+def _descendant_edges(child_id: str) -> list[dict]:
+    return [
+        {
+            "parent_node_id": child_id,
+            "child_node_id": f"{child_id}-{suffix}",
+            "dispatch_tool": dispatch_tool,
+        }
+        for suffix, _surface, dispatch_tool in _EXECUTION_DESCENDANTS
+    ]
+
+
+def _authority(
+    tmp_path,
+    *,
+    goals: tuple[str, ...] = (CHILD_GOAL,),
+    roots: list[str] | None = None,
+    with_descendants: bool = True,
+):
+    """Seal a parent with one delegate edge per goal and grant every node.
+
+    Each delegate child also gets its own sealed ``direct_model`` and
+    ``local_tool`` descendants so a bound child can perform real work without
+    any node ever holding two execution surfaces.
+    """
 
     store = Phase2AuthorityStore(tmp_path / "phase2_authority.db")
     child_ids = [f"child{i}" if i else "child" for i in range(len(goals))]
+    descendant_nodes: list[dict] = []
+    descendant_edges: list[dict] = []
+    if with_descendants:
+        for child_id in child_ids:
+            descendant_nodes.extend(_descendant_nodes(child_id, roots=roots))
+            descendant_edges.extend(_descendant_edges(child_id))
     plan = {
         "contract_version": 2,
         "graph_id": "g-delegate",
@@ -89,12 +151,14 @@ def _authority(tmp_path, *, goals: tuple[str, ...] = (CHILD_GOAL,)):
                 "dispatch_tool": "delegate_task",
             }
             for child_id in child_ids
-        ],
-        "nodes": [_node("parent", surface="local_tool")]
+        ]
+        + descendant_edges,
+        "nodes": [_node("parent", surface="local_tool", roots=roots)]
         + [
-            _node(child_id, surface="a2a", goal=goal)
+            _node(child_id, surface="a2a", goal=goal, roots=roots)
             for child_id, goal in zip(child_ids, goals)
-        ],
+        ]
+        + descendant_nodes,
     }
     store.seal_plan(plan, policy_hash=_hex("e"))
     parent = store.grant_node(
@@ -108,6 +172,11 @@ def _authority(tmp_path, *, goals: tuple[str, ...] = (CHILD_GOAL,)):
         )
         for child_id in child_ids
     ]
+    for node in descendant_nodes:
+        store.grant_node(
+            "g-delegate", node["node_id"], holder=f"delegate:{node['node_id']}",
+            ttl_s=TTL_S, attempt_id=f"at-{node['node_id']}", now=NOW,
+        )
     return store, parent, children[0] if len(children) == 1 else children, NOW
 
 
@@ -1001,7 +1070,7 @@ def test_delegate_tool_internal_child_authority_fields_are_not_model_visible():
 
 
 def test_model_supplied_authority_fields_cannot_select_child_authority(monkeypatch, tmp_path):
-    """Authority-shaped arguments are dropped, not honoured, even off-registry."""
+    """Authority-shaped arguments are rejected, not honoured, even off-registry."""
 
     store, parent, child, now = _authority(tmp_path)
     stub = _StubChild(0)
@@ -1022,11 +1091,16 @@ def test_model_supplied_authority_fields_cannot_select_child_authority(monkeypat
             )
         )
 
-    entry = payload["results"][0]
-    assert entry["parent_action_id"] == "g-delegate:parent:at-parent"
-    assert entry["child_action_id"] == "g-delegate:child:at-child"
-    # The sealed child budget governed the reservation, not the forged one.
-    assert stub.observed_envelope["budgets"]["tokens_max"] == 1000
+    assert "unsupported field(s)" in payload["error"]
+    for field in ("budget_reservation_id", "child_envelope", "parent_action_id"):
+        assert field in payload["error"]
+    # Nothing ran and nothing was reserved: the shape is refused before any
+    # child is resolved, reserved, or built.
+    assert stub.observed_envelope is None
+    assert store.budget_usage("g-delegate", "parent", fence=1)["reserved_tokens"] == 0
+    assert [event["kind"] for event in store.read_events("g-delegate")].count(
+        "BUDGET_RESERVED"
+    ) == 0
 
 
 def test_tool_executor_and_run_agent_delegate_paths_enforce_equivalently(monkeypatch):
@@ -1076,3 +1150,633 @@ def test_tool_executor_and_run_agent_delegate_paths_enforce_equivalently(monkeyp
         assert call["background"] is True
     assert seen[0]["goal"] == seen[1]["goal"]
     assert seen[0]["role"] == seen[1]["role"]
+
+
+# --------------------------------------------------------------------------
+# Request-shape ambiguity (contract v2 §9: one canonical dispatch shape)
+# --------------------------------------------------------------------------
+
+
+def test_nested_tasks_injection_cannot_smuggle_an_unsealed_goal(monkeypatch, tmp_path):
+    """The exact regression: a model-authored nested ``tasks`` list is rejected.
+
+    Before the fix the outer item's unsealed goal was dispatched while the
+    nested list selected which sealed child authority the run bound to, so the
+    executed work and the authority that vouched for it came from different
+    places.  There is now exactly one dispatch shape, so the request dies before
+    resolution, reservation, or dispatch.
+    """
+
+    store, parent, children, now = _authority(tmp_path, goals=(CHILD_GOAL, SECOND_GOAL))
+    stubs = [_StubChild(0), _StubChild(1)]
+    parent_agent = _wire_delegate_tool(monkeypatch, tmp_path, store, stubs)
+
+    with store.bind_current(parent, now=now):
+        payload = json.loads(
+            delegate_tool.delegate_task(
+                tasks=[
+                    {
+                        "goal": "TOTALLY UNSEALED GOAL",
+                        "tasks": [{"goal": CHILD_GOAL}],
+                    }
+                ],
+                parent_agent=parent_agent,
+            )
+        )
+
+    assert "unsupported field(s): tasks" in payload["error"]
+    assert all(stub.observed_envelope is None for stub in stubs)
+    assert not any(stub.started.is_set() for stub in stubs)
+    usage = store.budget_usage("g-delegate", "parent", fence=1)
+    assert usage["reserved_tokens"] == 0
+    assert usage["reserved_usd"] == 0.0
+    kinds = {event["kind"] for event in store.read_events("g-delegate")}
+    assert "BUDGET_RESERVED" not in kinds
+    assert "RESULT_ACCEPTED" not in kinds
+
+
+def test_enforcement_seam_rejects_the_same_nested_injection(monkeypatch, tmp_path):
+    """The tool seam and the dispatch seam agree on the one canonical shape."""
+
+    store, parent, child, now = _authority(tmp_path)
+    monkeypatch.setenv("HERMES_ENVELOPE_ENFORCE", "1")
+
+    with store.bind_current(parent, now=now):
+        decision = phase2_enforcement.evaluate_tool_call(
+            "delegate_task",
+            {"tasks": [{"goal": "TOTALLY UNSEALED GOAL", "tasks": [{"goal": CHILD_GOAL}]}]},
+            now=now,
+        )
+
+    assert decision is not None
+    assert decision.code == "spawn_request_ambiguous"
+    assert "unsupported field(s): tasks" in decision.details[0]
+
+
+@pytest.mark.parametrize(
+    "task_item, expected",
+    [
+        ({"goal": CHILD_GOAL, "child_envelope": {}}, "unsupported field(s): child_envelope"),
+        ({"goal": CHILD_GOAL, "budget_reservation_id": "res-x"}, "budget_reservation_id"),
+        ({"goal": CHILD_GOAL, "parent_action_id": "g:parent:at"}, "parent_action_id"),
+        ({"goal": CHILD_GOAL, "role": "root"}, "role"),
+        ({"goal": ""}, "goal"),
+        ({"goal": {"nested": CHILD_GOAL}}, "goal"),
+        ({"context": CHILD_GOAL}, "goal"),
+        ("just a string", "object"),
+    ],
+)
+def test_strict_task_item_schema_rejects_every_non_canonical_item(
+    monkeypatch, tmp_path, task_item, expected
+):
+    store, parent, child, now = _authority(tmp_path)
+    stub = _StubChild(0)
+    parent_agent = _wire_delegate_tool(monkeypatch, tmp_path, store, [stub])
+
+    with store.bind_current(parent, now=now):
+        payload = json.loads(
+            delegate_tool.delegate_task(tasks=[task_item], parent_agent=parent_agent)
+        )
+
+    assert expected in payload["error"]
+    assert stub.observed_envelope is None
+    assert store.budget_usage("g-delegate", "parent", fence=1)["reserved_tokens"] == 0
+
+
+def test_arity_mismatch_fails_closed_before_dispatch_and_leaks_no_reservation(
+    monkeypatch, tmp_path
+):
+    """Prepared children must equal dispatched jobs, or nothing runs.
+
+    A surplus preparation is the shape a reservation leak takes: budget is held
+    on the parent's fence for a child that is never dispatched, never
+    reconciled, and never revoked.  The assertion fires before any child agent
+    is built, and the settlement backstop terminally closes every child that was
+    already reserved.
+    """
+
+    store, parent, children, now = _authority(tmp_path, goals=(CHILD_GOAL, SECOND_GOAL))
+    built: list[dict] = []
+    parent_agent = _wire_delegate_tool(monkeypatch, tmp_path, store, [])
+    monkeypatch.setattr(
+        delegate_tool, "_build_child_agent", lambda **kw: built.append(kw) or _StubChild(0)
+    )
+    real_prepare = phase2_enforcement.prepare_delegate_child_authority
+    monkeypatch.setattr(
+        phase2_enforcement,
+        "prepare_delegate_child_authority",
+        lambda function_args, **kw: real_prepare(
+            {"tasks": [{"goal": CHILD_GOAL}, {"goal": SECOND_GOAL}]}, **kw
+        ),
+    )
+
+    with store.bind_current(parent, now=now):
+        payload = json.loads(
+            delegate_tool.delegate_task(goal=CHILD_GOAL, parent_agent=parent_agent)
+        )
+
+    assert payload["code"] == "missing_child_authority"
+    assert "prepared 2 sealed children for 1 dispatched task" in " ".join(payload["details"])
+    assert built == []
+    usage = store.budget_usage("g-delegate", "parent", fence=1)
+    assert usage["reserved_tokens"] == 0
+    assert usage["reserved_usd"] == 0.0
+    # Both over-prepared children are terminally closed, not left holding budget.
+    revoked = {
+        event["node_id"]
+        for event in store.read_events("g-delegate")
+        if event["kind"] == "LEASE_REVOKED"
+    }
+    assert revoked == {"child", "child1"}
+
+
+# --------------------------------------------------------------------------
+# Real execution paths: a bound child does model and tool work under its own
+# separately sealed descendant nodes (contract v2 §4 one node, one surface)
+# --------------------------------------------------------------------------
+
+
+def _prepared_child(store, parent, child, now, *, goal: str = CHILD_GOAL):
+    with store.bind_current(parent, now=now):
+        return phase2_enforcement.prepare_delegate_child_authority(
+            {"tasks": [{"goal": goal}]},
+            child_envelopes=[child],
+            store=store,
+            now=now,
+        )[0]
+
+
+def _flags_on_agent():
+    """A real AIAgent with only its provider client and tool backend stubbed."""
+
+    from run_agent import AIAgent
+
+    home = Path(tempfile.mkdtemp(prefix="hermes-phase3-child-"))
+    (home / "logs").mkdir(parents=True, exist_ok=True)
+    tool_defs = [
+        {
+            "type": "function",
+            "function": {
+                "name": "read_file",
+                "description": "read one file",
+                "parameters": {"type": "object", "properties": {}},
+            },
+        }
+    ]
+    with (
+        patch("run_agent.get_tool_definitions", return_value=tool_defs),
+        patch("run_agent.check_toolset_requirements", return_value={}),
+        patch("run_agent.OpenAI"),
+        patch("run_agent._hermes_home", home),
+        patch("agent.model_metadata.fetch_model_metadata", return_value={}),
+    ):
+        agent = AIAgent(
+            api_key="test-key",
+            base_url="http://127.0.0.1:1/v1",
+            quiet_mode=True,
+            skip_context_files=True,
+            skip_memory=True,
+        )
+    agent.client = MagicMock()
+    for name, value in (
+        ("_cached_system_prompt", "You are helpful."),
+        ("_use_prompt_caching", False),
+        ("tool_delay", 0),
+        ("compression_enabled", False),
+        ("save_trajectories", False),
+        ("_flush_messages_to_session_db", MagicMock()),
+    ):
+        setattr(agent, name, value)
+    return agent
+
+
+def _run_real_tool_call(agent, messages, dispatch, *, path: str):
+    call = SimpleNamespace(
+        id="tc-child",
+        type="function",
+        function=SimpleNamespace(name="read_file", arguments=json.dumps({"path": path})),
+    )
+    with (
+        patch("run_agent.handle_function_call", side_effect=dispatch),
+        patch(
+            "agent.tool_executor.maybe_persist_tool_result",
+            side_effect=lambda **kwargs: kwargs["content"],
+        ),
+    ):
+        agent._execute_tool_calls_sequential(
+            SimpleNamespace(content="", tool_calls=[call]), messages, "task-child"
+        )
+
+
+def _enable_receipts(monkeypatch, tmp_path):
+    monkeypatch.setattr(
+        "agent.action_receipts._load_config",
+        lambda: {"observability": {"action_receipts": {"enabled": True}}},
+    )
+    receipts_path = tmp_path / "action_receipts.db"
+    monkeypatch.setattr("agent.action_receipts.default_db_path", lambda: receipts_path)
+    return receipts_path
+
+
+def test_bound_child_executes_a_real_tool_call_under_its_sealed_local_tool_node(
+    monkeypatch, tmp_path
+):
+    """An enforced child runs the real tool executor, not a stub.
+
+    Everything above ``handle_function_call`` is production code: argument
+    parsing, the Phase 2 seam, the idempotency claim, the action receipt, and
+    the result message.  The receipt must name the child's ``local_tool``
+    descendant, because that is the node whose authority actually permitted the
+    read.
+    """
+
+    tests_dir = str(Path(__file__).resolve().parent)
+    store, parent, child, now = _authority(tmp_path, roots=[tests_dir])
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("HERMES_ENVELOPE_ENFORCE", "1")
+    receipts_path = _enable_receipts(monkeypatch, tmp_path)
+    prepared = _prepared_child(store, parent, child, now)
+    dispatch = MagicMock(return_value="read-ok")
+    messages: list = []
+
+    with phase2_enforcement.bind_delegate_child_authority(prepared, store=store, now=now):
+        _run_real_tool_call(
+            _flags_on_agent(), messages, dispatch, path=str(Path(__file__).resolve())
+        )
+        bound = phase2_enforcement.current_sealed_envelope()
+
+    from agent.action_receipts import ActionReceiptLedger
+
+    recorded = ActionReceiptLedger(receipts_path).read_all()
+    dispatch.assert_called_once()
+    assert messages[0]["content"] == "read-ok"
+    assert bound["node_id"] == "child-tool"
+    assert bound["execution_surface"] == "local_tool"
+    assert len(recorded) == 1
+    assert recorded[0]["action_id"] == "g-delegate:child-tool:at-child-tool"
+    assert recorded[0]["execution_surface"] == "local_tool"
+
+
+def test_bound_child_executes_a_real_model_dispatch_under_its_sealed_model_node(
+    monkeypatch, tmp_path
+):
+    """The provider call runs through the production dispatch guard."""
+
+    from agent import conversation_loop
+
+    store, parent, child, now = _authority(tmp_path)
+    monkeypatch.setenv("HERMES_ENVELOPE_ENFORCE", "1")
+    prepared = _prepared_child(store, parent, child, now)
+    seen: list = []
+
+    def _dispatch():
+        seen.append(phase2_enforcement.current_sealed_envelope())
+        return "provider-response"
+
+    with phase2_enforcement.bind_delegate_child_authority(prepared, store=store, now=now):
+        result = conversation_loop._phase2_authorized_model_dispatch(_dispatch)
+        phase2_enforcement.record_budget_usage(tokens=120, usd=0.02)
+        usage = phase2_enforcement.current_budget_usage()
+
+    assert result == "provider-response"
+    assert seen[0]["node_id"] == "child-model"
+    assert seen[0]["execution_surface"] == "direct_model"
+    assert seen[0]["budgets"]["tokens_max"] == 500
+    # Spend is charged to the node that actually performed the inference.
+    assert usage["tokens"] == 120
+    assert usage["usd"] == pytest.approx(0.02)
+
+
+def test_child_model_and_tool_work_bind_two_different_sealed_nodes(monkeypatch, tmp_path):
+    """One node, one surface: the child never holds both at once.
+
+    Two seams inside a single bound child resolve to two distinct sealed nodes,
+    and each keeps its own budget meter across the switch — an inference's token
+    spend must not be charged to, or reset by, the tool node.
+    """
+
+    from agent import conversation_loop, tool_executor
+
+    tests_dir = str(Path(__file__).resolve().parent)
+    store, parent, child, now = _authority(tmp_path, roots=[tests_dir])
+    monkeypatch.setenv("HERMES_ENVELOPE_ENFORCE", "1")
+    prepared = _prepared_child(store, parent, child, now)
+
+    with phase2_enforcement.bind_delegate_child_authority(prepared, store=store, now=now):
+        model_node = conversation_loop._phase2_authorized_model_dispatch(
+            phase2_enforcement.current_sealed_envelope
+        )
+        phase2_enforcement.record_budget_usage(tokens=10, usd=0.01)
+        block = tool_executor._phase2_enforcement_block(
+            function_name="read_file",
+            function_args={"path": str(Path(__file__).resolve())},
+            effective_task_id="task-child",
+        )
+        tool_node = phase2_enforcement.current_sealed_envelope()
+        tool_usage = phase2_enforcement.current_budget_usage()
+        conversation_loop._phase2_authorized_model_dispatch(lambda: None)
+        model_usage = phase2_enforcement.current_budget_usage()
+
+    assert block is None
+    assert model_node["node_id"] == "child-model"
+    assert tool_node["node_id"] == "child-tool"
+    assert model_node["execution_surface"] == "direct_model"
+    assert tool_node["execution_surface"] == "local_tool"
+    assert prepared.envelope["execution_surface"] == "a2a"
+    # Separate meters, each surviving the surface switch.
+    assert tool_usage["tokens"] == 0
+    assert model_usage["tokens"] == 10
+
+
+def test_delegated_child_does_real_model_and_tool_work_through_delegate_task(
+    monkeypatch, tmp_path
+):
+    """End to end: delegate_task -> bound child -> real model call and tool call."""
+
+    from agent import conversation_loop, tool_executor
+
+    tests_dir = str(Path(__file__).resolve().parent)
+    store, parent, child, now = _authority(tmp_path, roots=[tests_dir])
+    observed: dict = {}
+
+    class _WorkingChild(_StubChild):
+        def run_conversation(self, user_message=None, task_id=None, stream_callback=None):
+            observed["delegation"] = phase2_enforcement.current_sealed_envelope()
+            observed["model"] = conversation_loop._phase2_authorized_model_dispatch(
+                phase2_enforcement.current_sealed_envelope
+            )
+            observed["tool_block"] = tool_executor._phase2_enforcement_block(
+                function_name="read_file",
+                function_args={"path": str(Path(__file__).resolve())},
+                effective_task_id="task-child",
+            )
+            observed["tool"] = phase2_enforcement.current_sealed_envelope()
+            return super().run_conversation(user_message, task_id, stream_callback)
+
+    stub = _WorkingChild(0)
+    parent_agent = _wire_delegate_tool(monkeypatch, tmp_path, store, [stub])
+
+    with store.bind_current(parent, now=now):
+        payload = json.loads(
+            delegate_tool.delegate_task(goal=CHILD_GOAL, parent_agent=parent_agent)
+        )
+
+    assert payload["results"][0]["status"] == "completed"
+    assert observed["delegation"]["node_id"] == "child"
+    assert observed["tool_block"] is None
+    assert observed["model"]["node_id"] == "child-model"
+    assert observed["tool"]["node_id"] == "child-tool"
+    # The child settled against its own delegation node, not a descendant.
+    assert payload["results"][0]["child_action_id"] == "g-delegate:child:at-child"
+
+
+# --------------------------------------------------------------------------
+# Revocation is re-checked at every child execution seam, not only on accept
+# --------------------------------------------------------------------------
+
+
+def test_revoked_child_is_stopped_at_its_next_execution_seam(monkeypatch, tmp_path):
+    """Binding once does not buy a child the right to keep acting.
+
+    Acceptance-only rejection lets a revoked child keep emitting model calls and
+    tool actions for the rest of its run and only discovers the revocation when
+    it tries to hand back a result.  The child's own grant is therefore re-read
+    from the durable store at every seam.
+    """
+
+    from agent import conversation_loop, tool_executor
+
+    tests_dir = str(Path(__file__).resolve().parent)
+    store, parent, child, now = _authority(tmp_path, roots=[tests_dir])
+    monkeypatch.setenv("HERMES_ENVELOPE_ENFORCE", "1")
+    prepared = _prepared_child(store, parent, child, now)
+
+    with phase2_enforcement.bind_delegate_child_authority(prepared, store=store, now=now):
+        assert conversation_loop._phase2_authorized_model_dispatch(lambda: "ok") == "ok"
+
+        store.revoke_node(child, now=now)
+
+        with pytest.raises(conversation_loop.Phase2ModelDispatchBlocked) as excinfo:
+            conversation_loop._phase2_authorized_model_dispatch(
+                lambda: pytest.fail("revoked child dispatched a model call")
+            )
+        blocked = json.loads(
+            tool_executor._phase2_enforcement_block(
+                function_name="read_file",
+                function_args={"path": str(Path(__file__).resolve())},
+                effective_task_id="task-child",
+            )
+        )
+
+    assert excinfo.value.decision.code == "delegated_authority_not_current"
+    assert blocked["code"] == "delegated_authority_not_current"
+
+
+def test_revoked_execution_descendant_stops_that_surface_only(monkeypatch, tmp_path):
+    """Each descendant carries its own revocable authority."""
+
+    from agent import conversation_loop, tool_executor
+
+    tests_dir = str(Path(__file__).resolve().parent)
+    store, parent, child, now = _authority(tmp_path, roots=[tests_dir])
+    monkeypatch.setenv("HERMES_ENVELOPE_ENFORCE", "1")
+    prepared = _prepared_child(store, parent, child, now)
+    model_node = store.current_authority("g-delegate", "child-model")["envelope"]
+
+    with phase2_enforcement.bind_delegate_child_authority(prepared, store=store, now=now):
+        assert conversation_loop._phase2_authorized_model_dispatch(lambda: "ok") == "ok"
+
+        store.revoke_node(model_node, now=now)
+
+        with pytest.raises(conversation_loop.Phase2ModelDispatchBlocked) as excinfo:
+            conversation_loop._phase2_authorized_model_dispatch(
+                lambda: pytest.fail("revoked model node dispatched")
+            )
+        # The independently sealed tool node is untouched by that revocation.
+        assert (
+            tool_executor._phase2_enforcement_block(
+                function_name="read_file",
+                function_args={"path": str(Path(__file__).resolve())},
+                effective_task_id="task-child",
+            )
+            is None
+        )
+
+    assert excinfo.value.decision.code == "execution_authority_not_current"
+
+
+def test_child_execution_fails_closed_when_no_surface_is_sealed(monkeypatch, tmp_path):
+    """No sealed descendant means no execution — never an implicit exemption."""
+
+    from agent import conversation_loop, tool_executor
+
+    store, parent, child, now = _authority(tmp_path, with_descendants=False)
+    monkeypatch.setenv("HERMES_ENVELOPE_ENFORCE", "1")
+    prepared = _prepared_child(store, parent, child, now)
+
+    with phase2_enforcement.bind_delegate_child_authority(prepared, store=store, now=now):
+        with pytest.raises(conversation_loop.Phase2ModelDispatchBlocked) as excinfo:
+            conversation_loop._phase2_authorized_model_dispatch(
+                lambda: pytest.fail("unsealed surface dispatched a model call")
+            )
+        blocked = json.loads(
+            tool_executor._phase2_enforcement_block(
+                function_name="read_file",
+                function_args={"path": str(Path(__file__).resolve())},
+                effective_task_id="task-child",
+            )
+        )
+        still_delegation = phase2_enforcement.current_sealed_envelope()
+
+    assert excinfo.value.decision.code == "execution_surface_unsealed"
+    assert blocked["code"] == "execution_surface_unsealed"
+    assert still_delegation["node_id"] == "child"
+
+
+# --------------------------------------------------------------------------
+# Descendants are contained by the authority they descend from
+# --------------------------------------------------------------------------
+
+
+def _authority_with_tool_descendant_override(tmp_path, override: dict):
+    store = Phase2AuthorityStore(tmp_path / "phase2_authority.db")
+    descendants = _descendant_nodes("child")
+    for node in descendants:
+        if node["node_id"] == "child-tool":
+            node.update(override)
+    plan = {
+        "contract_version": 2,
+        "graph_id": "g-delegate",
+        "edges": [
+            {
+                "parent_node_id": "parent",
+                "child_node_id": "child",
+                "dispatch_tool": "delegate_task",
+            }
+        ]
+        + _descendant_edges("child"),
+        "nodes": [
+            _node("parent", surface="local_tool"),
+            _node("child", surface="a2a", goal=CHILD_GOAL),
+        ]
+        + descendants,
+    }
+    store.seal_plan(plan, policy_hash=_hex("e"))
+    parent = store.grant_node(
+        "g-delegate", "parent", holder="hermes:parent", ttl_s=TTL_S,
+        attempt_id="at-parent", now=NOW,
+    )
+    child = store.grant_node(
+        "g-delegate", "child", holder="delegate:child", ttl_s=TTL_S,
+        attempt_id="at-child", now=NOW,
+    )
+    for node in descendants:
+        store.grant_node(
+            "g-delegate", node["node_id"], holder=f"delegate:{node['node_id']}",
+            ttl_s=TTL_S, attempt_id=f"at-{node['node_id']}", now=NOW,
+        )
+    return store, parent, child, NOW
+
+
+@pytest.mark.parametrize(
+    "override, widened",
+    [
+        ({"budgets": {"usd_max": 99.0, "tokens_max": 500, "wall_clock_s_max": 30}},
+         "budgets.usd_max"),
+        ({"budgets": {"usd_max": 0.5, "tokens_max": 99999, "wall_clock_s_max": 30}},
+         "budgets.tokens_max"),
+        ({"roots": ["/"], "permissions": {"read": ["/"], "write": [], "spawn": []}},
+         "roots"),
+        ({"permissions": {"read": ["/tmp"], "write": ["/tmp"], "spawn": []},
+          "verifier_policy": {"required": True, "verifier_lane_must_differ": True,
+                              "clean_workspace_required": True}},
+         "permissions.write"),
+        ({"network_policy": "allowlist", "network_allowlist": ["example.com"]},
+         "network_policy"),
+        ({"exec_policy": "host"}, "exec_policy"),
+        ({"destructive_policy": "allow_within_roots"}, "destructive_policy"),
+        ({"lane": "omp"}, "lane"),
+        ({"deadline_utc": "2031-01-01T00:00:00+00:00"}, "deadline_utc"),
+    ],
+)
+def test_descendant_that_widens_delegated_authority_is_rejected(
+    monkeypatch, tmp_path, override, widened
+):
+    """A sealed descendant may narrow the delegated authority, never widen it.
+
+    Otherwise the descendant edge becomes a privilege-escalation channel: a
+    contained a2a child would reach a wider surface simply by executing.
+    """
+
+    from agent import tool_executor
+
+    store, parent, child, now = _authority_with_tool_descendant_override(tmp_path, override)
+    monkeypatch.setenv("HERMES_ENVELOPE_ENFORCE", "1")
+    prepared = _prepared_child(store, parent, child, now)
+
+    with phase2_enforcement.bind_delegate_child_authority(prepared, store=store, now=now):
+        blocked = json.loads(
+            tool_executor._phase2_enforcement_block(
+                function_name="read_file",
+                function_args={"path": str(Path(__file__).resolve())},
+                effective_task_id="task-child",
+            )
+        )
+        bound = phase2_enforcement.current_sealed_envelope()
+
+    assert blocked["code"] == "execution_surface_unsealed"
+    assert widened in " ".join(blocked["details"])
+    assert bound["node_id"] == "child"
+
+
+# --------------------------------------------------------------------------
+# Flags-off parity for every new seam (invariant 8 / gate G0)
+# --------------------------------------------------------------------------
+
+
+def test_flags_off_child_execution_seams_bind_and_charge_nothing(monkeypatch, tmp_path):
+    """With enforcement off, nothing resolves, binds, or blocks."""
+
+    from agent import conversation_loop, tool_executor
+
+    store, parent, child, now = _authority(tmp_path, with_descendants=False)
+    monkeypatch.delenv("HERMES_ENVELOPE_ENFORCE", raising=False)
+    prepared = _prepared_child(store, parent, child, now)
+
+    with phase2_enforcement.bind_delegate_child_authority(prepared, store=store, now=now):
+        assert conversation_loop._phase2_authorized_model_dispatch(lambda: "ok") == "ok"
+        assert (
+            tool_executor._phase2_enforcement_block(
+                function_name="write_file",
+                function_args={"path": "/etc/anywhere", "content": "x"},
+                effective_task_id="task-child",
+            )
+            is None
+        )
+        # The delegation node stays bound; no descendant is ever resolved.
+        assert phase2_enforcement.current_sealed_envelope()["node_id"] == "child"
+
+
+def test_flags_off_canonical_delegation_still_runs_without_authority(monkeypatch, tmp_path):
+    """A well-formed request behaves exactly as it did before this change."""
+
+    store, parent, child, now = _authority(tmp_path)
+    stub = _StubChild(0)
+    parent_agent = _wire_delegate_tool(monkeypatch, tmp_path, store, [stub], enforce=False)
+
+    payload = json.loads(
+        delegate_tool.delegate_task(
+            tasks=[{"goal": CHILD_GOAL, "role": "leaf"}], parent_agent=parent_agent
+        )
+    )
+
+    entry = payload["results"][0]
+    assert entry["status"] == "completed"
+    assert "parent_action_id" not in entry
+    assert stub.observed_envelope is None
+    # Sealing/granting happened in the fixture; the delegation itself recorded
+    # nothing, exactly as before this change.
+    kinds = {event["kind"] for event in store.read_events("g-delegate")}
+    assert kinds.isdisjoint(
+        {"BUDGET_RESERVED", "BUDGET_RECONCILED", "RESULT_ACCEPTED", "LEASE_REVOKED"}
+    )

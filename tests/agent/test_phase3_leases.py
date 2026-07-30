@@ -3,9 +3,9 @@
 These exercise the Hermes-owned authority store's movement from a valid Phase 2
 sealed candidate into live Phase 3 ownership discipline (contract v2 §5, §9):
 
-* renewal atomically extends an active renewable lease, bound to the current
-  holder/attempt/fence, and re-points authoritative validation at the renewed
-  envelope without reviving a dead lease;
+* renewal atomically extends an active renewable lease through bounded external
+  metadata bound to the current holder/attempt/fence, while the original sealed
+  grant envelope remains immutable and authoritative;
 * revocation cancels a current lease and permits an immediate regrant at the
   next monotonic fence while the old envelope validates stale/revoked;
 * completion accepts the current unexpired holder/attempt/fence exactly once and
@@ -316,6 +316,7 @@ def test_concurrent_completion_has_exactly_one_winner(tmp_path):
 
     barrier = threading.Barrier(8)
     winners: list[dict] = []
+    idempotent: list[dict] = []
     failures: list[str] = []
     lock = threading.Lock()
 
@@ -326,8 +327,9 @@ def test_concurrent_completion_has_exactly_one_winner(tmp_path):
                 envelope, result_hash=_sha("r1"), now=now + timedelta(seconds=5)
             )
             with lock:
-                # Idempotent redeliveries are not original acceptances.
-                if not record.get("idempotent"):
+                if record.get("idempotent"):
+                    idempotent.append(record)
+                else:
                     winners.append(record)
         except (AuthorityError, ResultRejection) as exc:
             with lock:
@@ -340,8 +342,10 @@ def test_concurrent_completion_has_exactly_one_winner(tmp_path):
         thread.join()
 
     assert len(winners) == 1
-    # Total outcomes == total threads (some may be idempotent, some failures).
-    assert len(winners) + len(failures) <= 8
+    assert len(winners) + len(idempotent) + len(failures) == 8
+    assert len(idempotent) == 7
+    events = store.read_events("g-authority")
+    assert len([event for event in events if event["kind"] == "RESULT_ACCEPTED"]) == 1
 
 
 # ── Slice 4: recovery verifies/derives lifecycle events, fails closed ────────

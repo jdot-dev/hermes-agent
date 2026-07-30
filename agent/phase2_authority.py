@@ -196,6 +196,12 @@ class Phase2AuthorityStore:
             CREATE UNIQUE INDEX IF NOT EXISTS one_accepted_result_per_node
             ON authority_events(graph_id, node_id)
             WHERE kind = 'RESULT_ACCEPTED';
+            CREATE UNIQUE INDEX IF NOT EXISTS one_terminal_result_per_node
+            ON authority_events(graph_id, node_id)
+            WHERE kind IN ('RESULT_ACCEPTED', 'NODE_COMPLETED');
+            CREATE UNIQUE INDEX IF NOT EXISTS one_grant_per_attempt
+            ON authority_events(attempt_id)
+            WHERE kind = 'LEASE_GRANTED';
             """
         )
 
@@ -441,16 +447,20 @@ class Phase2AuthorityStore:
         )
 
     @staticmethod
-    def _attempt_seen(conn: sqlite3.Connection, graph_id: str, node_id: str, attempt_id: str) -> bool:
-        """True if the attempt_id was ever granted for this graph/node."""
+    def _attempt_seen(conn: sqlite3.Connection, attempt_id: str) -> bool:
+        """True if the attempt_id was ever granted anywhere in this authority store.
+
+        ``attempt_id`` identifies one execution attempt, not one node-local
+        sequence slot. Contract v2 §4 requires it to be new per attempt and
+        never reused, including on another graph or node.
+        """
 
         return (
             conn.execute(
                 """SELECT 1 FROM authority_events
-                   WHERE graph_id = ? AND node_id = ? AND kind = 'LEASE_GRANTED'
-                     AND attempt_id = ?
+                   WHERE kind = 'LEASE_GRANTED' AND attempt_id = ?
                    LIMIT 1""",
-                (graph_id, node_id, attempt_id),
+                (attempt_id,),
             ).fetchone()
             is not None
         )
@@ -487,8 +497,8 @@ class Phase2AuthorityStore:
                 plan, node = self._load_plan_node(conn, graph_id, node_id)
                 if self._terminal_completed(conn, graph_id, node_id):
                     raise AuthorityError("node is terminal and cannot be regranted")
-                if self._attempt_seen(conn, graph_id, node_id, attempt_id):
-                    raise AuthorityError(f"attempt_id {attempt_id} was already used for this node")
+                if self._attempt_seen(conn, attempt_id):
+                    raise AuthorityError(f"attempt_id {attempt_id} was already used")
                 authority = self._node_authority(conn, graph_id, node_id)
                 if authority is not None:
                     if not authority["revoked"] and not authority["completed"]:
@@ -639,6 +649,10 @@ class Phase2AuthorityStore:
                 authoritative = authority["envelope"]
                 deadline = _parse_time(authoritative["deadline_utc"])
                 new_expires = renewed_at + timedelta(seconds=ttl)
+                # A renewal is a heartbeat extension. It may never shorten the
+                # authority window or append a no-op renewal event.
+                if new_expires <= authority["effective_expires"]:
+                    raise AuthorityError("renewal must extend the effective lease expiry")
                 # The new effective expiry must not reach or exceed the deadline.
                 if new_expires >= deadline:
                     raise AuthorityError(

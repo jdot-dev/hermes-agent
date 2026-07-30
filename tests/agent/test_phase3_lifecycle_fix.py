@@ -140,6 +140,25 @@ def test_renew_ttl_is_duration_from_renewal_moment(tmp_path):
     assert record["envelope"]["lease"]["ttl_s"] == 30
 
 
+def test_renew_rejects_effective_expiry_that_does_not_extend_current_lease(tmp_path):
+    store = Phase2AuthorityStore(tmp_path / "a.db")
+    envelope = _granted(store, NOW, ttl_s=300)
+
+    before = store.current_authority("g-authority", "n-tool")
+    assert before["effective_expires_utc"] == (NOW + timedelta(seconds=300)).isoformat()
+
+    # A heartbeat renewal must extend authority, never shorten it or merely
+    # rewrite the same expiry under a fresh event.
+    with pytest.raises(AuthorityError, match="extend"):
+        store.renew_node(envelope, ttl_s=10, now=NOW + timedelta(seconds=5))
+    with pytest.raises(AuthorityError, match="extend"):
+        store.renew_node(envelope, ttl_s=295, now=NOW + timedelta(seconds=5))
+
+    after = store.current_authority("g-authority", "n-tool")
+    assert after == before
+    assert "LEASE_RENEWED" not in _kinds(store.read_events("g-authority"))
+
+
 # ── Blocker 2: revoke must bind holder and canonical envelope identity ──────
 
 
@@ -215,6 +234,53 @@ def test_grant_rejects_attempt_id_reuse_after_natural_expiry(tmp_path):
             attempt_id="at-1",
             now=NOW + timedelta(seconds=31),
         )
+
+
+def test_grant_rejects_attempt_id_reuse_on_another_node(tmp_path):
+    store = Phase2AuthorityStore(tmp_path / "a.db")
+    store.seal_plan(
+        _plan(_node("n-one"), _node("n-two")),
+        policy_hash="d" * 64,
+        now=NOW,
+    )
+    store.grant_node(
+        "g-authority",
+        "n-one",
+        holder="hermes:one",
+        ttl_s=300,
+        attempt_id="at-global",
+        now=NOW,
+    )
+
+    # attempt_id is an attempt identity, not a node-local sequence number.
+    # Contract v2 §4 says it is new per attempt and never reused.
+    with pytest.raises(AuthorityError, match="attempt"):
+        store.grant_node(
+            "g-authority",
+            "n-two",
+            holder="hermes:two",
+            ttl_s=300,
+            attempt_id="at-global",
+            now=NOW,
+        )
+
+    # The invariant is also backed by a partial unique index, not only a
+    # pre-insert application query.
+    with sqlite3.connect(store.db_path) as conn:
+        index_sql = conn.execute(
+            """SELECT sql FROM sqlite_master
+               WHERE type='index' AND name='one_grant_per_attempt'"""
+        ).fetchone()[0]
+        assert "LEASE_GRANTED" in index_sql
+        with pytest.raises(sqlite3.IntegrityError):
+            conn.execute(
+                """INSERT INTO authority_events(
+                       event_id, ts_utc, kind, graph_id, node_id, attempt_id, fence,
+                       payload_json, prev_event_hash, event_hash
+                   ) VALUES ('ev-attempt-x', '2030-01-01T00:00:00+00:00', 'LEASE_GRANTED',
+                             'g-authority', 'n-two', 'at-global', 1,
+                             '{}', NULL, 'ev-attempt-x-hash')"""
+            )
 
 
 # ── Blocker 4: terminal completion permanently closes the node ──────────────
@@ -373,9 +439,12 @@ def test_at_most_one_accepted_result_backed_by_schema(tmp_path):
     path = store.db_path
     with sqlite3.connect(path) as conn:
         idx = conn.execute(
-            "SELECT name, sql FROM sqlite_master WHERE type='index' AND sql LIKE '%RESULT_ACCEPTED%'"
-        ).fetchall()
-        assert idx, "expected a partial unique index backstopping RESULT_ACCEPTED"
+            """SELECT name, sql FROM sqlite_master
+               WHERE type='index' AND name='one_terminal_result_per_node'"""
+        ).fetchone()
+        assert idx, "expected a partial unique index backstopping terminal acceptance"
+        assert "RESULT_ACCEPTED" in idx[1]
+        assert "NODE_COMPLETED" in idx[1]
 
         # Attempt to bypass the app guard and insert a second acceptance raw.
         last = conn.execute(
@@ -389,6 +458,16 @@ def test_at_most_one_accepted_result_backed_by_schema(tmp_path):
                    ) VALUES ('ev-x', '2030-01-01T00:00:00+00:00', 'RESULT_ACCEPTED',
                              'g-authority', 'n-tool', 'at-1', 1,
                              '{"result_hash":"aa"}', ?, 'ev-x-hash')""",
+                (last,),
+            )
+        with pytest.raises(sqlite3.IntegrityError):
+            conn.execute(
+                """INSERT INTO authority_events(
+                       event_id, ts_utc, kind, graph_id, node_id, attempt_id, fence,
+                       payload_json, prev_event_hash, event_hash
+                   ) VALUES ('ev-legacy-x', '2030-01-01T00:00:00+00:00', 'NODE_COMPLETED',
+                             'g-authority', 'n-tool', 'at-legacy', 99,
+                             '{}', ?, 'ev-legacy-x-hash')""",
                 (last,),
             )
 

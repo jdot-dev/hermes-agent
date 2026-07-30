@@ -17,6 +17,7 @@ The parent's context only sees the delegation call and the summary result,
 never the child's intermediate tool calls or reasoning.
 """
 
+import copy
 import enum
 import contextvars
 import json
@@ -41,6 +42,11 @@ from agent.interrupt_compat import request_hard_interrupt
 # not natively known (named custom providers, third-party aggregators, etc.).
 # Must match hermes_cli.runtime_provider.RUNTIME_PROVIDER_TYPE_CUSTOM.
 _RUNTIME_PROVIDER_CUSTOM = "custom"
+
+_DELEGATION_ROUTE_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
+_DELEGATION_ROUTE_FIELDS = frozenset(
+    {"model", "provider", "base_url", "api_key", "api_mode"}
+)
 from tools import file_state
 from tools.terminal_tool import set_approval_callback as _set_subagent_approval_cb
 from utils import base_url_hostname, is_truthy_value
@@ -1776,12 +1782,26 @@ def _build_child_agent(
     else:
         parent_toolsets = set(DEFAULT_TOOLSETS)
 
-    if toolsets:
+    # Operator-owned defaults can narrow every child without exposing toolset
+    # selection to the model. Absent or malformed config preserves the legacy
+    # parent-inheritance behavior. A configured empty list intentionally gives
+    # leaf children no enabled toolsets.
+    configured_default_toolsets = delegation_cfg.get("default_toolsets")
+    if toolsets is None and isinstance(configured_default_toolsets, list):
+        requested_toolsets: Optional[List[str]] = [
+            item.strip()
+            for item in configured_default_toolsets
+            if isinstance(item, str) and item.strip()
+        ]
+    else:
+        requested_toolsets = toolsets
+
+    if requested_toolsets is not None:
         # Intersect with parent — subagent must not gain tools the parent lacks.
         # Expand composite toolsets (e.g. hermes-cli) so that individual
         # toolset names (e.g. web, terminal) are recognised during intersection.
         expanded_parent = _expand_parent_toolsets(parent_toolsets)
-        child_toolsets = [t for t in toolsets if t in expanded_parent]
+        child_toolsets = [t for t in requested_toolsets if t in expanded_parent]
         if _get_inherit_mcp_toolsets():
             child_toolsets = _preserve_parent_mcp_toolsets(
                 child_toolsets, parent_toolsets
@@ -3783,6 +3803,7 @@ def delegate_task(
     tasks: Optional[List[Dict[str, Any]]] = None,
     max_iterations: Optional[int] = None,
     role: Optional[str] = None,
+    route: Optional[str] = None,
     background: Optional[bool] = None,
     output_schema: Optional[Dict[str, Any]] = None,
     action: Optional[str] = None,
@@ -3796,8 +3817,8 @@ def delegate_task(
     already-running ones.
 
     Spawn modes (action='spawn' or omitted):
-      - Single: provide goal (+ optional context and role)
-      - Batch:  provide tasks array [{goal, context, role}, ...]
+      - Single: provide goal (+ optional context, role, and configured route)
+      - Batch:  provide tasks array [{goal, context, role, route}, ...]
 
     Control modes (synchronous, never backgrounded):
       - action='list'  -> live children of this conversation's spawn tree
@@ -3809,6 +3830,8 @@ def delegate_task(
     'leaf' (default) cannot; 'orchestrator' retains the delegation
     toolset and can spawn its own workers, bounded by
     delegation.max_spawn_depth.  Per-task role beats the top-level one.
+    In batch mode, routes are selected per task; the top-level route is only
+    used as a fallback when a task omits its own route.
 
     Returns JSON with results array, one entry per task.
     """
@@ -3878,24 +3901,6 @@ def delegate_task(
         )
     effective_max_iter = default_max_iter
 
-    # Resolve delegation credentials (provider:model pair).
-    # When delegation.provider is configured, this resolves the full credential
-    # bundle (base_url, api_key, api_mode) via the same runtime provider system
-    # used by CLI/gateway startup.  When unconfigured, returns None values so
-    # children inherit from the parent.
-    #
-    # ``credentials_cfg`` (internal callers only — never model-facing) is a
-    # per-call override shaped like the delegation config section
-    # ({provider, model, base_url, api_key, api_mode}); the /review engine
-    # uses it to route its reviewer subagent onto ``auxiliary.review``
-    # without touching the global delegation pin.
-    try:
-        creds = _resolve_delegation_credentials(
-            credentials_cfg if credentials_cfg else cfg, parent_agent
-        )
-    except ValueError as exc:
-        return tool_error(str(exc))
-
     # Normalize to task list
     max_children = _get_max_concurrent_children()
     recovered_tasks, tasks_error = _recover_tasks_from_json_string(tasks)
@@ -3922,7 +3927,12 @@ def delegate_task(
             )
         task_list = tasks
     elif goal and isinstance(goal, str) and goal.strip():
-        single_task: Dict[str, Any] = {"goal": goal, "context": context, "role": top_role}
+        single_task: Dict[str, Any] = {
+            "goal": goal,
+            "context": context,
+            "role": top_role,
+            "route": route,
+        }
         if output_schema is not None:
             single_task["output_schema"] = output_schema
         task_list = [single_task]
@@ -3972,6 +3982,32 @@ def delegate_task(
             return tool_error(f"Task {i} output_schema invalid: {schema_err}")
         task_schemas.append(coerced_schema)
 
+    # Validate every route before resolving any credentials. This keeps a later
+    # invalid batch item from triggering provider lookup, credential loading, or
+    # any other route-specific side effect for an earlier valid item.
+    base_credentials_cfg = credentials_cfg if credentials_cfg else cfg
+    effective_routes: List[Optional[str]] = [
+        task.get("route") or route for task in task_list
+    ]
+    try:
+        route_cfgs = [
+            _resolve_delegation_route_config(base_credentials_cfg, effective_route)
+            for effective_route in effective_routes
+        ]
+    except ValueError as exc:
+        return tool_error(str(exc))
+
+    # Resolve each child's provider:model bundle independently only after the
+    # whole batch's operator-owned route names have passed validation.
+    task_creds: List[Dict[str, Any]] = []
+    try:
+        for route_cfg in route_cfgs:
+            task_creds.append(
+                _resolve_delegation_credentials(route_cfg, parent_agent)
+            )
+    except ValueError as exc:
+        return tool_error(str(exc))
+
     overall_start = time.monotonic()
     results = []
 
@@ -3990,8 +4026,21 @@ def delegate_task(
         wrap_progress_callback,
     )
 
+    manifest_identities = [
+        (
+            item.get("model") or getattr(parent_agent, "model", None),
+            item.get("provider") or getattr(parent_agent, "provider", None),
+        )
+        for item in task_creds
+    ]
+    manifest_model, manifest_provider = manifest_identities[0]
+    if len(set(manifest_identities)) != 1:
+        manifest_model = manifest_provider = "mixed"
     live_deleg_id, live_writers, live_paths = create_live_transcripts(
-        task_list, context, model=creds.get("model"), provider=creds.get("provider")
+        task_list,
+        context,
+        model=manifest_model,
+        provider=manifest_provider,
     )
 
     # Capture the ORIGINATING session's wake target BEFORE any child agent is
@@ -4022,6 +4071,7 @@ def delegate_task(
     # subagent-lifecycle API).
     children = []
     for i, t in enumerate(task_list):
+        creds = task_creds[i]
         # Per-task role beats top-level; normalise again so unknown
         # per-task values warn and degrade to leaf uniformly.
         effective_role = _normalize_role(t.get("role") or top_role)
@@ -4446,6 +4496,21 @@ def delegate_task(
             return tuple(parts), in_tool
 
         _goals = [t["goal"] for t in task_list]
+        _route_identities = [
+            (
+                effective_routes[index],
+                item.get("model") or getattr(parent_agent, "model", None),
+                item.get("provider") or getattr(parent_agent, "provider", None),
+                item.get("base_url") or getattr(parent_agent, "base_url", None),
+                item.get("api_mode") or getattr(parent_agent, "api_mode", None),
+            )
+            for index, item in enumerate(task_creds)
+        ]
+        _dispatch_model = (
+            _route_identities[0][1]
+            if _route_identities and len(set(_route_identities)) == 1
+            else "mixed"
+        )
         dispatch = dispatch_async_delegation_batch(
             goals=_goals,
             context=context,
@@ -4453,7 +4518,7 @@ def delegate_task(
             # parent's toolsets (no model-facing toolsets arg).
             toolsets=None,
             role=top_role,
-            model=creds["model"],
+            model=_dispatch_model,
             session_key=_session_key,
             origin_ui_session_id=_origin_ui_session_id,
             origin_session_id=_wake_sid,
@@ -4654,6 +4719,53 @@ def _merge_request_overrides(runtime_overrides, explicit_overrides):
     elif explicit_extra is not None:
         merged["extra_body"] = explicit_extra
     return merged or None
+
+
+def _configured_delegation_routes(cfg: dict) -> Dict[str, Dict[str, Any]]:
+    """Return valid operator-owned route presets from delegation.routes."""
+    raw_routes = cfg.get("routes")
+    if not isinstance(raw_routes, dict):
+        return {}
+    routes: Dict[str, Dict[str, Any]] = {}
+    for raw_name, raw_route in raw_routes.items():
+        if not isinstance(raw_name, str) or not _DELEGATION_ROUTE_NAME_RE.fullmatch(raw_name):
+            continue
+        if not isinstance(raw_route, dict):
+            continue
+        routes[raw_name] = {
+            key: value
+            for key, value in raw_route.items()
+            if key in _DELEGATION_ROUTE_FIELDS
+        }
+    return routes
+
+
+def _resolve_delegation_route_config(
+    cfg: dict, route_name: Optional[str]
+) -> dict:
+    """Overlay a named route onto legacy delegation config.
+
+    Route names are model-selectable only after the operator configures them.
+    Raw route definitions are copied and only allowlisted provider fields are
+    overlaid; delegation.routes is never forwarded to credential resolution.
+    """
+    if route_name is None or not str(route_name).strip():
+        return cfg
+    route_name = str(route_name).strip()
+    routes = _configured_delegation_routes(cfg)
+    if route_name not in routes:
+        available = ", ".join(sorted(routes)) or "none"
+        raise ValueError(
+            f"Unknown delegation route '{route_name}'. "
+            f"Configured routes: {available}."
+        )
+    effective = {
+        key: copy.deepcopy(value)
+        for key, value in cfg.items()
+        if key != "routes"
+    }
+    effective.update(copy.deepcopy(routes[route_name]))
+    return effective
 
 
 def _resolve_delegation_credentials(cfg: dict, parent_agent) -> dict:
@@ -5045,7 +5157,34 @@ def _build_dynamic_schema_overrides() -> dict:
     overrides_params["properties"] = {
         k: dict(v) for k, v in DELEGATE_TASK_SCHEMA["parameters"]["properties"].items()
     }
+    overrides_params["properties"]["tasks"] = copy.deepcopy(
+        DELEGATE_TASK_SCHEMA["parameters"]["properties"]["tasks"]
+    )
     overrides_params["properties"]["tasks"]["description"] = _build_tasks_param_description()
+
+    route_names = sorted(_configured_delegation_routes(_load_config()))
+    if route_names:
+        route_schema = {
+            "type": "string",
+            "enum": route_names,
+            "description": (
+                "Select an operator-configured delegation route. Only the "
+                "listed route names are accepted; provider/model endpoints "
+                "remain controlled by config.yaml."
+            ),
+        }
+        overrides_params["properties"]["route"] = dict(route_schema)
+        overrides_params["properties"]["route"]["description"] = (
+            "Route for single-task mode. " + route_schema["description"]
+        )
+        overrides_params["properties"]["tasks"]["items"]["properties"][
+            "route"
+        ] = dict(route_schema)
+        overrides_params["properties"]["tasks"]["items"]["properties"][
+            "route"
+        ]["description"] = (
+            "Per-task route override. " + route_schema["description"]
+        )
 
     return {
         "description": _build_top_level_description(),
@@ -5213,6 +5352,7 @@ registry.register(
         tasks=_strip_model_hidden_task_fields(args.get("tasks")),
         max_iterations=args.get("max_iterations"),
         role=args.get("role"),
+        route=args.get("route"),
         background=_model_background_value(args, kw.get("parent_agent")),
         output_schema=args.get("output_schema"),
         action=args.get("action"),

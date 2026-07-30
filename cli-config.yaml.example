@@ -1561,6 +1561,9 @@ delegation:
                                               # The parent TUI owns stdin, so blocking would deadlock; non-interactive resolution is required.
                                               # Both choices emit a logger.warning audit line. Flip to true only for cron/batch pipelines.
   # inherit_mcp_toolsets: true                # When explicit child toolsets are narrowed, also keep the parent's MCP toolsets (default: true). Set false for strict intersection.
+  # default_toolsets: ["terminal", "file", "web"]  # Optional operator-owned child capability ceiling.
+                                              # Children receive only entries also available to the parent;
+                                              # omitted/malformed = preserve parent inheritance, [] = no enabled toolsets.
   # model: "google/gemini-3-flash-preview"    # Override model for subagents (empty = inherit parent)
   # provider: "openrouter"                    # Override provider for subagents (empty = inherit parent)
   #                                           # Resolves full credentials (base_url, api_key) automatically.
@@ -1569,6 +1572,16 @@ delegation:
   #                                           # delegation.model to an inexpensive one — children carry the
   #                                           # vast majority of tokens, so this is where spend is cut while
   #                                           # planning quality stays with the frontier parent.
+  # routes:                                   # Optional named provider/model presets exposed to delegate_task.
+  #   local:
+  #     model: "qwen2.5-coder"
+  #     base_url: "http://localhost:1234/v1"
+  #     api_key: "local-key"
+  #   hosted-fast:
+  #     model: "google/gemini-flash-2.0"
+  #     provider: "openrouter"
+                                              # Routes may override only model, provider, base_url, api_key,
+                                              # and api_mode; unknown route names fail before credential lookup.
 
 # =============================================================================
 # Honcho Integration (Cross-Session User Modeling)

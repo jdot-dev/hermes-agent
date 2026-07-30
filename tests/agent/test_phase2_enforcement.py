@@ -350,19 +350,36 @@ def test_delegate_task_remains_blocked_until_child_authority_is_bound(monkeypatc
 
 
 def test_delegate_task_rejects_unlisted_role_and_nested_batch(monkeypatch, tmp_path):
+    """Every rejected spawn shape reports its own reason and fails closed.
+
+    Phase 3 makes a *well-formed* batch enforceable — each task resolves to its
+    own separately sealed child through a graph edge — so a batch is no longer
+    categorically ambiguous. It is now rejected one step later, for the reason
+    that actually applies: no sealed child exists for it (see
+    ``tests/agent/test_phase3_delegate_authority.py`` for the enforced path).
+    """
+
     _set_enabled(monkeypatch, True)
     envelope = _envelope(
         tmp_path,
         permissions={"read": [str(tmp_path)], "write": [], "spawn": ["delegate_task:leaf"]},
     )
-    for args in (
-        {"goal": "inspect", "role": "orchestrator"},
-        {"tasks": [{"goal": "one"}, {"goal": "two"}]},
-    ):
+    expected = {
+        # Role outside the sealed spawn list — denied by policy, before any
+        # graph lookup, so the operator sees the policy reason.
+        "spawn_policy_denied": {"goal": "inspect", "role": "orchestrator"},
+        # Batch that is not a bounded list of task objects.
+        "spawn_request_ambiguous": {"tasks": []},
+        # Well-formed batch with no separately sealed child behind it.
+        "spawn_child_authority_not_enforceable": {
+            "tasks": [{"goal": "one"}, {"goal": "two"}]
+        },
+    }
+    for code, args in expected.items():
         with phase2_enforcement.bind_sealed_envelope(envelope, current_fence=1):
             decision = phase2_enforcement.evaluate_tool_call("delegate_task", args, cwd=str(tmp_path))
         assert decision is not None
-        assert decision.code in {"spawn_policy_denied", "spawn_request_ambiguous"}
+        assert decision.code == code, (args, decision)
 
 
 def test_terminal_destructive_command_respects_policy(monkeypatch, tmp_path):

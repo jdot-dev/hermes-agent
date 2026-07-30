@@ -6,7 +6,23 @@ from contextvars import copy_context
 from datetime import datetime, timedelta, timezone
 import threading
 
+import pytest
+
 from agent import phase2_enforcement
+
+NON_FINITE = [("nan", float("nan")), ("+inf", float("inf")), ("-inf", float("-inf"))]
+
+# Every numeric field ``validate_sealed_envelope`` bounds. A non-finite value in
+# any of them makes the corresponding ceiling meaningless, so the envelope must
+# be refused as invalid rather than enforced against.
+ENVELOPE_NUMERIC_FIELDS = [
+    ("budgets", "usd_max"),
+    ("budgets", "tokens_max"),
+    ("budgets", "wall_clock_s_max"),
+    ("cancellation", "grace_s"),
+    ("lease", "ttl_s"),
+    ("retry_policy", "backoff_s"),
+]
 
 
 def _envelope(**overrides) -> dict:
@@ -149,3 +165,117 @@ def test_budget_context_is_reset_after_scope():
         phase2_enforcement.record_budget_usage(tokens=1, usd=0.1)
         assert phase2_enforcement.current_budget_usage()["tokens"] == 1
     assert phase2_enforcement.current_budget_usage() is None
+
+
+# ── non-finite numbers must fail closed at every runtime seam (v2 §9) ───────
+
+
+@pytest.fixture
+def enforcing(monkeypatch):
+    monkeypatch.setattr(
+        phase2_enforcement,
+        "_load_config",
+        lambda: {"enforcement": {"task_envelopes": {"enabled": True}}},
+    )
+
+
+@pytest.mark.parametrize(
+    "group,key",
+    ENVELOPE_NUMERIC_FIELDS,
+    ids=[f"{g}.{k}" for g, k in ENVELOPE_NUMERIC_FIELDS],
+)
+@pytest.mark.parametrize("label,bad", NON_FINITE, ids=[label for label, _ in NON_FINITE])
+def test_non_finite_envelope_ceilings_block_as_invalid_not_as_driver_errors(
+    enforcing, group, key, label, bad
+):
+    envelope = _envelope()
+    envelope[group] = {**envelope[group], key: [0, bad] if key == "backoff_s" else bad}
+
+    assert phase2_enforcement.validate_sealed_envelope(envelope) == [f"{group}.{key}"]
+
+    with phase2_enforcement.bind_sealed_envelope(envelope, current_fence=1):
+        decision = phase2_enforcement.evaluate_tool_call(
+            "read_file", {"path": "/tmp/inside.txt"}, cwd="/tmp"
+        )
+
+    # Typed and field-naming: the caller learns which ceiling is unusable.
+    # Unguarded, these values passed validation and reached the int() coercion
+    # inside the enforcement path, crashing it untypedly instead of blocking.
+    assert decision is not None
+    assert decision.code == "invalid_sealed_envelope"
+    assert decision.details == (f"{group}.{key}",)
+
+
+@pytest.mark.parametrize("label,bad", NON_FINITE, ids=[label for label, _ in NON_FINITE])
+def test_non_finite_envelope_also_blocks_direct_model_dispatch(enforcing, label, bad):
+    envelope = _envelope(execution_surface="direct_model")
+    envelope["budgets"] = {**envelope["budgets"], "tokens_max": bad}
+
+    with phase2_enforcement.bind_sealed_envelope(envelope, current_fence=1):
+        decision = phase2_enforcement.evaluate_runtime_authority()
+
+    assert decision is not None
+    assert decision.code == "invalid_sealed_envelope"
+    assert decision.details == ("budgets.tokens_max",)
+
+
+@pytest.mark.parametrize("label,bad", NON_FINITE, ids=[label for label, _ in NON_FINITE])
+def test_non_finite_charge_is_refused_and_leaves_the_meter_enforceable(enforcing, label, bad):
+    # A single nan charge used to poison the running total permanently: every
+    # later `usd >= usd_max` comparison against nan is False, so the ceiling
+    # could never be breached again no matter how much was really spent.
+    envelope = _envelope(budgets={"usd_max": 0.5, "tokens_max": 100, "wall_clock_s_max": 10})
+    with phase2_enforcement.bind_sealed_envelope(envelope, current_fence=1):
+        with pytest.raises(ValueError, match="finite"):
+            phase2_enforcement.record_budget_usage(tokens=1, usd=bad)
+
+        # The refusal is total: neither the cost nor the token side is charged.
+        usage = phase2_enforcement.current_budget_usage()
+        assert usage["usd"] == 0.0
+        assert usage["tokens"] == 0
+        assert usage["cost_unknown"] is False
+
+        # The meter still works, and the ceiling it guards still fires.
+        phase2_enforcement.record_budget_usage(tokens=1, usd=0.5)
+        decision = phase2_enforcement.evaluate_tool_call(
+            "read_file", {"path": "/tmp/inside.txt"}, cwd="/tmp"
+        )
+
+    assert decision is not None
+    assert decision.code == "budget_exhausted"
+    assert decision.details == ("usd_max",)
+
+
+def test_non_finite_charge_refusal_does_not_disturb_a_concurrent_meter():
+    # The guard raises before taking the lock, so a rejected charge on one
+    # worker cannot corrupt or deadlock the shared meter for the others.
+    with phase2_enforcement.bind_sealed_envelope(_envelope(), current_fence=1):
+        barrier = threading.Barrier(8)
+        refused: list[bool] = []
+        lock = threading.Lock()
+
+        def charge(index: int) -> None:
+            barrier.wait()
+            if index % 2:
+                try:
+                    phase2_enforcement.record_budget_usage(tokens=1, usd=float("nan"))
+                except ValueError:
+                    with lock:
+                        refused.append(True)
+            else:
+                phase2_enforcement.record_budget_usage(tokens=1, usd=0.01)
+
+        threads = []
+        for index in range(8):
+            context = copy_context()
+            thread = threading.Thread(target=context.run, args=(charge, index))
+            threads.append(thread)
+            thread.start()
+        for thread in threads:
+            thread.join()
+
+        usage = phase2_enforcement.current_budget_usage()
+
+    assert len(refused) == 4
+    assert usage["tokens"] == 4
+    assert round(float(usage["usd"]), 2) == 0.04

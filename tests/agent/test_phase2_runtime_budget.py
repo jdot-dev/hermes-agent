@@ -12,13 +12,13 @@ from agent import phase2_enforcement
 def _envelope(**overrides) -> dict:
     now = datetime.now(timezone.utc)
     base = {
-        "envelope_version": 1,
+        "envelope_version": 2,
         "graph_id": "g-budget",
         "node_id": "n-budget",
         "attempt_id": "at-budget",
         "idempotency_key": "d" * 64,
         "objective": "enforce node budgets",
-        "execution_surface": "direct_model",
+        "execution_surface": "local_tool",
         "lane": "hermes",
         "roots": ["/tmp"],
         "permissions": {"read": ["/tmp"], "write": [], "spawn": []},
@@ -100,7 +100,9 @@ def test_unknown_cost_blocks_further_execution_when_usd_budget_is_authoritative(
         "_load_config",
         lambda: {"enforcement": {"task_envelopes": {"enabled": True}}},
     )
-    with phase2_enforcement.bind_sealed_envelope(_envelope(), current_fence=1):
+    with phase2_enforcement.bind_sealed_envelope(
+        _envelope(execution_surface="direct_model"), current_fence=1
+    ):
         phase2_enforcement.record_budget_usage(tokens=1, usd=None)
         decision = phase2_enforcement.evaluate_runtime_authority()
     assert decision is not None

@@ -20,7 +20,7 @@ import os
 import random
 import threading
 import time
-from typing import Any, Optional
+from typing import Any, Mapping, Optional
 
 from agent.display import (
     KawaiiSpinner,
@@ -227,6 +227,7 @@ def _maybe_record_action_receipt(
         if not is_enabled():
             return
 
+        from agent.phase2_enforcement import current_sealed_envelope
         from agent.task_envelope import build_shadow_envelope
 
         try:
@@ -235,13 +236,20 @@ def _maybe_record_action_receipt(
             cwd = None
 
         session_id = getattr(agent, "session_id", "") or None
-        envelope = build_shadow_envelope(
-            tool_name=function_name,
-            args=function_args,
-            cwd=str(cwd) if cwd else None,
-            session_id=session_id,
-            task_id=effective_task_id or None,
-            tool_call_id=tool_call_id or None,
+        envelope = current_sealed_envelope()
+        if envelope is None:
+            envelope = build_shadow_envelope(
+                tool_name=function_name,
+                args=function_args,
+                cwd=str(cwd) if cwd else None,
+                session_id=session_id,
+                task_id=effective_task_id or None,
+                tool_call_id=tool_call_id or None,
+            )
+        receipt_cwd = (
+            getattr(envelope, "cwd", None)
+            if not isinstance(envelope, Mapping)
+            else str(cwd) if cwd else None
         )
         ActionReceiptLedger().record_receipt(
             tool_name=function_name,
@@ -252,7 +260,7 @@ def _maybe_record_action_receipt(
             session_id=session_id,
             task_id=effective_task_id or None,
             tool_call_id=tool_call_id or None,
-            cwd=envelope.cwd,
+            cwd=receipt_cwd,
             envelope=envelope,
         )
     except Exception as exc:
@@ -372,6 +380,72 @@ def _apply_tool_request_middleware_for_agent(
     except Exception as exc:
         logger.debug("tool_request middleware error: %s", exc)
         return function_args, []
+
+
+def _phase2_enforcement_block(
+    *,
+    function_name: str,
+    function_args: dict,
+    effective_task_id: str,
+) -> Optional[str]:
+    """Return a serialized fail-closed Phase 2 block, or ``None``."""
+
+    from agent import phase2_enforcement
+
+    try:
+        cwd = getattr(get_active_env(effective_task_id), "cwd", None)
+    except Exception:
+        cwd = None
+    destructive = (
+        function_name == "terminal"
+        and _is_destructive_command(str(function_args.get("command", "")))
+    )
+    try:
+        decision = phase2_enforcement.evaluate_tool_call(
+            function_name,
+            function_args,
+            cwd=str(cwd) if cwd else None,
+            destructive=destructive,
+        )
+    except Exception:
+        if not phase2_enforcement.is_enabled():
+            return None
+        logger.exception("Phase 2 envelope enforcement failed closed")
+        return json.dumps(
+            {
+                "error": "Task-envelope enforcement failed closed",
+                "status": "blocked",
+                "error_type": "envelope_enforcement_block",
+                "code": "enforcement_internal_error",
+                "details": [],
+            },
+            ensure_ascii=False,
+        )
+    if decision is None:
+        return None
+    return json.dumps(decision.to_dict(), ensure_ascii=False)
+
+
+def _phase2_idempotency_block(
+    *,
+    function_name: str,
+    function_args: dict,
+) -> Optional[str]:
+    """Atomically claim a mutating operation immediately before dispatch."""
+
+    from agent import phase2_enforcement
+
+    try:
+        decision = phase2_enforcement.claim_mutating_tool(function_name, function_args)
+    except Exception:
+        if not phase2_enforcement.is_enabled():
+            return None
+        logger.exception("Phase 2 idempotency claim failed closed")
+        decision = phase2_enforcement.EnforcementBlock(
+            "idempotency_internal_error",
+            "Phase 2 idempotency enforcement failed closed",
+        )
+    return None if decision is None else json.dumps(decision.to_dict(), ensure_ascii=False)
 
 
 def _run_agent_tool_execution_middleware(
@@ -535,9 +609,26 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
         # ── Block evaluation (BEFORE checkpoint preflight) ───────────
         # We must know whether the tool will execute before touching
         # checkpoint state (dedup slot, real snapshots).
-        block_result = None
+        block_result = _phase2_enforcement_block(
+            function_name=function_name,
+            function_args=function_args,
+            effective_task_id=effective_task_id,
+        )
         blocked_by_guardrail = False
-        if _ts_scope_block is not None:
+        if block_result is not None:
+            _emit_terminal_post_tool_call(
+                agent,
+                function_name=function_name,
+                function_args=function_args,
+                result=block_result,
+                effective_task_id=effective_task_id,
+                tool_call_id=getattr(tool_call, "id", "") or "",
+                status="blocked",
+                error_type="envelope_enforcement_block",
+                error_message=block_result,
+                middleware_trace=list(middleware_trace),
+            )
+        elif _ts_scope_block is not None:
             # Out-of-scope tool_call: reject before hooks/guardrails/dispatch.
             block_result = _ts_scope_block
             _emit_terminal_post_tool_call(
@@ -599,6 +690,28 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                         error_message=getattr(guardrail_decision, "message", None) or "Tool blocked by guardrail policy",
                         middleware_trace=list(middleware_trace),
                     )
+
+        # All policy gates passed. Claim mutations before callbacks,
+        # checkpointing, or dispatch can produce an effect.
+        if block_result is None:
+            claim_block = _phase2_idempotency_block(
+                function_name=function_name,
+                function_args=function_args,
+            )
+            if claim_block is not None:
+                block_result = claim_block
+                _emit_terminal_post_tool_call(
+                    agent,
+                    function_name=function_name,
+                    function_args=function_args,
+                    result=block_result,
+                    effective_task_id=effective_task_id,
+                    tool_call_id=getattr(tool_call, "id", "") or "",
+                    status="blocked",
+                    error_type="envelope_enforcement_block",
+                    error_message=claim_block,
+                    middleware_trace=list(middleware_trace),
+                )
 
         # ── Checkpoint preflight (only for tools that will execute) ──
         if block_result is None:
@@ -1276,12 +1389,18 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
         )
 
         # Check plugin hooks for a block directive before executing.
-        _block_msg: Optional[str] = None
-        _block_error_type = "plugin_block"
-        if _ts_scope_block is not None:
+        _block_msg: Optional[str] = _phase2_enforcement_block(
+            function_name=function_name,
+            function_args=function_args,
+            effective_task_id=effective_task_id,
+        )
+        _block_error_type = (
+            "envelope_enforcement_block" if _block_msg is not None else "plugin_block"
+        )
+        if _block_msg is None and _ts_scope_block is not None:
             _block_msg = _ts_scope_block
             _block_error_type = "tool_scope_block"
-        else:
+        elif _block_msg is None:
             try:
                 from hermes_cli.plugins import resolve_pre_tool_block
                 _block_msg = resolve_pre_tool_block(
@@ -1302,6 +1421,15 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
             guardrail_decision = agent._tool_guardrails.before_call(function_name, function_args)
             if not guardrail_decision.allows_execution:
                 _guardrail_block_decision = guardrail_decision
+
+        if _block_msg is None and _guardrail_block_decision is None:
+            _claim_block = _phase2_idempotency_block(
+                function_name=function_name,
+                function_args=function_args,
+            )
+            if _claim_block is not None:
+                _block_msg = _claim_block
+                _block_error_type = "envelope_enforcement_block"
 
         _execution_blocked = _block_msg is not None or _guardrail_block_decision is not None
 
@@ -1381,8 +1509,12 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
         tool_start_time = time.time()
 
         if _block_msg is not None:
-            # Tool blocked by plugin policy — return error without executing.
-            function_result = json.dumps({"error": _block_msg}, ensure_ascii=False)
+            # Tool blocked before callbacks, checkpoints, or real dispatch.
+            function_result = (
+                _block_msg
+                if _block_error_type == "envelope_enforcement_block"
+                else json.dumps({"error": _block_msg}, ensure_ascii=False)
+            )
             tool_duration = 0.0
             _emit_terminal_post_tool_call(
                 agent,

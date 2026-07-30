@@ -408,6 +408,13 @@ class Phase2AuthorityStore:
             )
             if latest is None or envelope.get("fence") != latest["fence"]:
                 errors.append("stale_fence")
+            if latest is not None:
+                try:
+                    authoritative = json.loads(latest["payload_json"])["envelope"]
+                    if _canonical_json(dict(envelope)) != _canonical_json(authoritative):
+                        errors.append("envelope_not_authoritative")
+                except (KeyError, TypeError, ValueError):
+                    errors.append("authoritative_envelope_invalid")
             if envelope.get("planner_hash") != plan["planner_hash"]:
                 errors.append("planner_hash")
             if envelope.get("policy_hash") != plan["policy_hash"]:
@@ -609,6 +616,102 @@ class Phase2AuthorityStore:
             return self._budget_state(conn, graph_id, node_id, fence)
         finally:
             conn.close()
+
+    def recover(self, *, now: datetime | None = None) -> dict[str, int]:
+        """Verify the durable chain and poison expired, unreconciled reservations.
+
+        A crash after reservation but before provider accounting leaves spend
+        unknowable. Recovery reconciles that reservation with ``actual_usd=None``
+        once its owning lease expires, which preserves fail-closed budget behavior.
+        """
+
+        current = _utc(now)
+        reconciled_count = 0
+        with _DB_LOCK:
+            conn = self._connect()
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                rows = conn.execute("SELECT * FROM authority_events ORDER BY id").fetchall()
+                previous_hash: str | None = None
+                reservations: dict[str, sqlite3.Row] = {}
+                reconciled: set[str] = set()
+                grants: dict[tuple[str, str, int], dict[str, Any]] = {}
+                for row in rows:
+                    try:
+                        payload = json.loads(row["payload_json"])
+                    except (TypeError, ValueError) as exc:
+                        raise AuthorityError("authority event hash chain is invalid") from exc
+                    expected = _canonical_hash(
+                        {
+                            "event_id": row["event_id"],
+                            "ts_utc": row["ts_utc"],
+                            "kind": row["kind"],
+                            "graph_id": row["graph_id"],
+                            "node_id": row["node_id"],
+                            "attempt_id": row["attempt_id"],
+                            "fence": row["fence"],
+                            "payload": payload,
+                            "prev_event_hash": row["prev_event_hash"],
+                        }
+                    )
+                    if row["prev_event_hash"] != previous_hash or row["event_hash"] != expected:
+                        raise AuthorityError("authority event hash chain is invalid")
+                    previous_hash = row["event_hash"]
+                    if row["kind"] == "LEASE_GRANTED":
+                        grants[(row["graph_id"], row["node_id"], int(row["fence"]))] = payload
+                    elif row["kind"] == "BUDGET_RESERVED":
+                        reservations[row["event_id"]] = row
+                    elif row["kind"] == "BUDGET_RECONCILED":
+                        reconciled.add(str(payload.get("reservation_id")))
+
+                for reservation_id, reservation in reservations.items():
+                    if reservation_id in reconciled:
+                        continue
+                    grant = grants.get(
+                        (
+                            reservation["graph_id"],
+                            reservation["node_id"],
+                            int(reservation["fence"]),
+                        )
+                    )
+                    if grant is None:
+                        raise AuthorityError("orphaned reservation has no authoritative lease")
+                    try:
+                        envelope = grant["envelope"]
+                        lease = envelope["lease"]
+                        expires = _parse_time(lease["granted_utc"]) + timedelta(
+                            seconds=float(lease["ttl_s"])
+                        )
+                    except (KeyError, TypeError, ValueError, AuthorityError) as exc:
+                        raise AuthorityError("orphaned reservation lease is invalid") from exc
+                    if current < expires:
+                        continue
+                    self._append_event(
+                        conn,
+                        kind="BUDGET_RECONCILED",
+                        graph_id=reservation["graph_id"],
+                        node_id=reservation["node_id"],
+                        attempt_id=reservation["attempt_id"],
+                        fence=reservation["fence"],
+                        payload={
+                            "reservation_id": reservation_id,
+                            "actual_tokens": 0,
+                            "actual_usd": None,
+                            "recovery": "expired_lease_unknown_spend",
+                        },
+                        now=current,
+                    )
+                    reconciled_count += 1
+                conn.execute("COMMIT")
+            except Exception:
+                try:
+                    conn.execute("ROLLBACK")
+                except Exception:
+                    pass
+                raise
+            finally:
+                conn.close()
+        return {"orphaned_reservations_reconciled": reconciled_count}
 
     def get_planner_hash(self, graph_id: str) -> str | None:
         conn = self._connect()

@@ -24,6 +24,11 @@ from hermes_cli.service_manager import (
 )
 
 
+# Captured at module import time so the regression test proves isolation is
+# active during pytest collection, before autouse fixtures begin setup.
+_COLLECTION_SCANDIR = S6ServiceManager().scandir
+
+
 # ---------------------------------------------------------------------------
 # validate_profile_name
 # ---------------------------------------------------------------------------
@@ -210,6 +215,7 @@ def test_s6_default_scandir_isolated_during_pytest(
 
     mgr = S6ServiceManager()
 
+    assert _COLLECTION_SCANDIR != Path("/run/service")
     assert mgr.scandir == pytest_scandir
     assert mgr.scandir != Path("/run/service")
 

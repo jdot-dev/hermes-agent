@@ -159,40 +159,27 @@ jobs:
       - name: Warm image snapshot
         run: docker run --rm ${{ env.IMAGE_NAME }}:test true
 
-      # TEMPORARY DIAGNOSTIC (remove after the boot-serialization bug is
-      # fixed): single boots take ~6s but N concurrent boots all finish
-      # together at ~460s (runs 30600678580 / 30601872038) regardless of
-      # N=4 or 8. Reproduce minimally: time 1 serial boot, then 4
-      # concurrent boots, and dump per-line timestamped container logs so
-      # the stalled cont-init phase identifies itself.
-      - name: DIAG concurrent boot serialization
+      # TEMPORARY DIAGNOSTIC v2 (remove once the stall is named): raw
+      # concurrent boots are FAST on this pod (1-2s, diag v1 run
+      # 30604214067) yet boot-heavy pytest files stall ~464s through
+      # scripts/run_tests.sh. Isolate the delta: run ONE whale file
+      # through the exact production path with a docker-events tape and
+      # wall-clock stamps. If it stalls alone here, the problem is the
+      # pytest/conftest/hermetic-env layer — and the events tape shows
+      # what dockerd was asked vs when.
+      - name: DIAG single whale via run_tests.sh
         run: |
           set -uo pipefail
-          img="${{ env.IMAGE_NAME }}:test"
-          boot_one() {
-            local n="$1" t0 t1
-            t0=$(date +%s)
-            docker run -d --name "warm-$n" "$img" sleep 300 >/dev/null
-            until docker exec "warm-$n" sh -c 'grep -q "profile=default" /opt/data/logs/container-boot.log 2>/dev/null'; do
-              sleep 0.5
-            done
-            t1=$(date +%s)
-            echo "boot[$n]: $((t1 - t0))s"
-          }
-          echo "=== serial baseline ==="
-          boot_one serial
-          docker rm -f warm-serial >/dev/null
-          echo "=== 4 concurrent boots ==="
-          T0=$(date +%s)
-          for i in 1 2 3 4; do boot_one "c$i" & done
-          wait
-          echo "concurrent wall: $(( $(date +%s) - T0 ))s"
-          echo "=== timestamped boot log of c1 (phase timing) ==="
-          docker logs -t warm-c1 2>&1 | head -40
-          echo "=== timestamped boot log of c4 ==="
-          docker logs -t warm-c4 2>&1 | head -40
-          for i in 1 2 3 4; do docker rm -f "warm-c$i" >/dev/null; done
-        timeout-minutes: 20
+          docker events --format '{{.Time}} {{.Type}} {{.Action}} {{.Actor.Attributes.name}}' > /tmp/docker-events.log 2>&1 &
+          EV=$!
+          echo "T0=$(date +%s) start whale"
+          HERMES_TEST_WORKERS=8 HERMES_TEST_IMAGE="${{ env.IMAGE_NAME }}:test" \
+            scripts/run_tests.sh tests/docker/test_dashboard.py --file-timeout 600 || true
+          echo "T1=$(date +%s) whale done"
+          kill "$EV" 2>/dev/null || true
+          echo "=== docker events tape ==="
+          cat /tmp/docker-events.log || true
+        timeout-minutes: 15
 
       - name: Run docker integration tests
         # HERMES_TEST_WORKERS=8: this suite shares ONE dockerd, so width

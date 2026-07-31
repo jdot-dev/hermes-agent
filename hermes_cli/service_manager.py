@@ -336,18 +336,18 @@ S6_SERVICE_PREFIX = "gateway-"
 
 
 def _default_s6_scandir() -> Path:
-    """Return the production scandir, or an explicitly isolated pytest one.
+    """Return the production scandir, or an explicitly isolated test one.
 
-    ``HERMES_TEST_S6_SCANDIR`` is honored only while pytest marks a test as
-    active. This keeps ordinary runtime configuration fixed at
-    ``/run/service`` while allowing the hermetic test fixture to prevent
+    The hermetic pytest fixture sets ``HERMES_TEST_S6_SCANDIR`` to prevent
     container-aware tests from registering, stopping, or restarting live s6
-    services when the suite itself runs inside a production container.
+    services when the suite itself runs inside a production container. Normal
+    runtime processes do not set this internal test-only variable and continue
+    to use ``/run/service``.
     """
     import os
 
     isolated = os.environ.get("HERMES_TEST_S6_SCANDIR")
-    if isolated and os.environ.get("PYTEST_CURRENT_TEST"):
+    if isolated:
         return Path(isolated)
     return S6_DYNAMIC_SCANDIR
 

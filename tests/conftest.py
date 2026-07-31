@@ -370,6 +370,14 @@ def _hermetic_environment(tmp_path, monkeypatch):
     (fake_hermes_home / "memories").mkdir()
     (fake_hermes_home / "skills").mkdir()
     monkeypatch.setenv("HERMES_HOME", str(fake_hermes_home))
+    # s6's live scandir is outside HERMES_HOME. When the suite itself runs
+    # inside a supervised production container, container-aware tests would
+    # otherwise register/stop/restart real gateways under /run/service.
+    # Point default S6ServiceManager instances at this per-test directory;
+    # explicit scandir arguments used by unit/integration tests still win.
+    fake_s6_scandir = tmp_path / "s6-scandir"
+    fake_s6_scandir.mkdir()
+    monkeypatch.setenv("HERMES_TEST_S6_SCANDIR", str(fake_s6_scandir))
 
     # 4. Deterministic locale / timezone / hashseed. CI runs in UTC with
     #    C.UTF-8 locale; local dev often doesn't. Pin everything.

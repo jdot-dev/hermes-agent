@@ -182,10 +182,14 @@ def fake_subprocess_run(monkeypatch: pytest.MonkeyPatch):
     return calls
 
 
-def test_s6_manager_kind_and_supports_registration() -> None:
+def test_s6_manager_kind_and_supports_registration(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("HERMES_TEST_S6_SCANDIR", raising=False)
     mgr = S6ServiceManager()
     assert mgr.kind == "s6"
     assert mgr.supports_runtime_registration() is True
+    assert mgr.scandir == Path("/run/service")
 
 
 def test_s6_default_scandir_isolated_during_pytest(
@@ -199,7 +203,9 @@ def test_s6_default_scandir_isolated_during_pytest(
     interrupted the active operator session and leaked test profile slots.
     """
     pytest_scandir = tmp_path / "pytest-s6-scandir"
-    monkeypatch.setenv("PYTEST_CURRENT_TEST", "tests/test_example.py::test_case (call)")
+    # Collection and fixture setup run before PYTEST_CURRENT_TEST is set; the
+    # isolation must already apply during those phases.
+    monkeypatch.delenv("PYTEST_CURRENT_TEST", raising=False)
     monkeypatch.setenv("HERMES_TEST_S6_SCANDIR", str(pytest_scandir))
 
     mgr = S6ServiceManager()

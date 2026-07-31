@@ -149,6 +149,16 @@ jobs:
         with:
           command: uv sync --locked --python 3.11 --extra dev
 
+      # Warm the image before the parallel suite: the first `docker run`
+      # after a buildx --load triggers the containerd snapshotter to unpack
+      # ~3GB of layers into a rootfs snapshot. With the suite's 4 workers
+      # that unpack happens under 4 concurrent first-runs and serializes
+      # them all (~390s observed on run 30600678580: first 4 files stall
+      # together, everything after runs in seconds). One serial warmup run
+      # pays the unpack once, so the suite starts against a hot snapshot.
+      - name: Warm image snapshot
+        run: docker run --rm ${{ env.IMAGE_NAME }}:test true
+
       - name: Run docker integration tests
         uses: ./.github/actions/profile
         with:

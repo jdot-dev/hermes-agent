@@ -21,7 +21,9 @@ test runner at ``scripts/run_tests.sh``.
 
 import asyncio
 import os
+import shutil
 import sys
+import tempfile
 from pathlib import Path
 
 import pytest
@@ -543,10 +545,22 @@ def _ensure_current_event_loop(request):
 # delivery is harmless.
 
 _LIVE_SYSTEM_GUARD_BYPASS_MARK = "live_system_guard_bypass"
+_TEST_S6_SCANDIR: Path | None = None
 
 
 def pytest_configure(config):  # noqa: D401 — pytest hook
-    """Register markers used by hermetic conftest."""
+    """Register markers and isolate live s6 before collection starts."""
+    global _TEST_S6_SCANDIR
+
+    # Per-test fixtures are too late for collection-time imports and module
+    # setup. Set the process-wide default before pytest imports test modules,
+    # so no phase of a test subprocess can inherit the live /run/service tree.
+    # Explicit scandir arguments still win, and docker tests execute Hermes
+    # inside a separate test container where this process env is absent.
+    if _TEST_S6_SCANDIR is None:
+        _TEST_S6_SCANDIR = Path(tempfile.mkdtemp(prefix="hermes-pytest-s6-"))
+    os.environ["HERMES_TEST_S6_SCANDIR"] = str(_TEST_S6_SCANDIR)
+
     config.addinivalue_line(
         "markers",
         f"{_LIVE_SYSTEM_GUARD_BYPASS_MARK}: bypass the live-system guard "
@@ -561,6 +575,16 @@ def pytest_configure(config):  # noqa: D401 — pytest hook
     # suite runs natively there (POSIX keeps the more reliable signal method).
     if sys.platform == "win32" and getattr(config.option, "timeout_method", None) == "signal":
         config.option.timeout_method = "thread"
+
+
+def pytest_unconfigure(config):  # noqa: D401 — pytest hook
+    """Remove the process-wide temporary s6 scandir."""
+    global _TEST_S6_SCANDIR
+
+    if _TEST_S6_SCANDIR is not None:
+        shutil.rmtree(_TEST_S6_SCANDIR, ignore_errors=True)
+        _TEST_S6_SCANDIR = None
+    os.environ.pop("HERMES_TEST_S6_SCANDIR", None)
 
 
 @pytest.fixture(autouse=True)

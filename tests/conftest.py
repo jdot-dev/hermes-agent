@@ -1013,6 +1013,7 @@ def _ensure_current_event_loop(request):
 
 _LIVE_SYSTEM_GUARD_BYPASS_MARK = "live_system_guard_bypass"
 _REQUIRES_WAL_MARK = "requires_wal"
+_TEST_S6_SCANDIR: Path | None = None
 
 
 def _wal_is_usable() -> bool:
@@ -1157,7 +1158,13 @@ _OS_MARKS = {
 
 
 def pytest_configure(config):  # noqa: D401 — pytest hook
-    """Register markers used by hermetic conftest."""
+    """Register markers and isolate live s6 before collection starts."""
+    global _TEST_S6_SCANDIR
+
+    # Collection-time imports must never inherit the live /run/service tree.
+    if _TEST_S6_SCANDIR is None:
+        _TEST_S6_SCANDIR = Path(tempfile.mkdtemp(prefix="hermes-pytest-s6-"))
+    os.environ["HERMES_TEST_S6_SCANDIR"] = str(_TEST_S6_SCANDIR)
     config.addinivalue_line(
         "markers",
         f"{_LIVE_SYSTEM_GUARD_BYPASS_MARK}: bypass the live-system guard "
@@ -1207,6 +1214,16 @@ def pytest_configure(config):  # noqa: D401 — pytest hook
     # suite runs natively there (POSIX keeps the more reliable signal method).
     if sys.platform == "win32" and getattr(config.option, "timeout_method", None) == "signal":
         config.option.timeout_method = "thread"
+
+
+def pytest_unconfigure(config):  # noqa: D401 — pytest hook
+    """Remove the process-wide temporary s6 scandir."""
+    global _TEST_S6_SCANDIR
+
+    if _TEST_S6_SCANDIR is not None:
+        shutil.rmtree(_TEST_S6_SCANDIR, ignore_errors=True)
+        _TEST_S6_SCANDIR = None
+    os.environ.pop("HERMES_TEST_S6_SCANDIR", None)
 
 
 _symlink_supported_cache = None

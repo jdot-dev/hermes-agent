@@ -335,6 +335,23 @@ S6_DYNAMIC_SCANDIR = Path("/run/service")
 S6_SERVICE_PREFIX = "gateway-"
 
 
+def _default_s6_scandir() -> Path:
+    """Return the production scandir, or an explicitly isolated pytest one.
+
+    ``HERMES_TEST_S6_SCANDIR`` is honored only while pytest marks a test as
+    active. This keeps ordinary runtime configuration fixed at
+    ``/run/service`` while allowing the hermetic test fixture to prevent
+    container-aware tests from registering, stopping, or restarting live s6
+    services when the suite itself runs inside a production container.
+    """
+    import os
+
+    isolated = os.environ.get("HERMES_TEST_S6_SCANDIR")
+    if isolated and os.environ.get("PYTEST_CURRENT_TEST"):
+        return Path(isolated)
+    return S6_DYNAMIC_SCANDIR
+
+
 def _profile_dir_for_gateway_service(name: str) -> Path:
     """Resolve ``gateway-<profile>`` to its persistent profile directory.
 
@@ -608,8 +625,8 @@ class S6ServiceManager:
 
     kind: ServiceManagerKind = "s6"
 
-    def __init__(self, scandir: Path = S6_DYNAMIC_SCANDIR) -> None:
-        self.scandir = scandir
+    def __init__(self, scandir: Path | None = None) -> None:
+        self.scandir = Path(scandir) if scandir is not None else _default_s6_scandir()
 
     # -- internal helpers --------------------------------------------------
 

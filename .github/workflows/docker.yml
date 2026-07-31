@@ -173,8 +173,14 @@ jobs:
           docker events --format '{{.Time}} {{.Type}} {{.Action}} {{.Actor.Attributes.name}}' > /tmp/docker-events.log 2>&1 &
           EV=$!
           echo "T0=$(date +%s) start whale"
+          # v3: attempt-1 stalls 600s CLIENT-SIDE (zero daemon events, run
+          # 30604591780) and leaves state that makes attempt 2 instant.
+          # faulthandler dumps every thread's python stack at 120s so the
+          # stalled frame names itself; --file-retries 0 keeps attempt 1's
+          # output as THE output.
           HERMES_TEST_WORKERS=8 HERMES_TEST_IMAGE="${{ env.IMAGE_NAME }}:test" \
-            scripts/run_tests.sh tests/docker/test_dashboard.py --file-timeout 600 || true
+            scripts/run_tests.sh tests/docker/test_dashboard.py --file-timeout 300 --file-retries 0 \
+            -o faulthandler_timeout=120 || true
           echo "T1=$(date +%s) whale done"
           kill "$EV" 2>/dev/null || true
           echo "=== docker events tape ==="

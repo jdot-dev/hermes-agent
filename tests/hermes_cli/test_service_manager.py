@@ -7,6 +7,8 @@ implementation in this same file once that phase ships.
 """
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 
 from hermes_cli.service_manager import (
@@ -422,6 +424,26 @@ def test_s6_manager_kind_and_supports_registration() -> None:
     mgr = S6ServiceManager()
     assert mgr.kind == "s6"
     assert mgr.supports_runtime_registration() is True
+
+
+def test_s6_default_scandir_isolated_during_pytest(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A test process must never inherit the live s6 ``/run/service`` tree.
+
+    Regression: running the full suite inside the production container let
+    container-aware gateway tests register and restart live services, which
+    interrupted the active operator session and leaked test profile slots.
+    """
+    pytest_scandir = tmp_path / "pytest-s6-scandir"
+    monkeypatch.setenv("PYTEST_CURRENT_TEST", "tests/test_example.py::test_case (call)")
+    monkeypatch.setenv("HERMES_TEST_S6_SCANDIR", str(pytest_scandir))
+
+    mgr = S6ServiceManager()
+
+    assert mgr.scandir == pytest_scandir
+    assert mgr.scandir != Path("/run/service")
 
 
 # ---------------------------------------------------------------------------

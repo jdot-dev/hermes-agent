@@ -10747,10 +10747,12 @@ def _default_spawn(
     env = dict(os.environ)
     # The dispatcher is detached from every conversation. Its worker must never
     # inherit routing mirrored by a previous gateway turn, even before the first
-    # session binds ContextVars in this process.
+    # session binds ContextVars in this process. Removing the gateway marker also
+    # lets remote SSH workers retain the profile's TERMINAL_CWD bridge.
     from gateway.session_context import _VAR_MAP
     for key in _VAR_MAP:
         env.pop(key, None)
+    env.pop("_HERMES_GATEWAY", None)
 
     # Inject HERMES_HOME so the worker reads the profile-scoped config.yaml
     # (fallback_providers, toolsets, agent settings, etc.) instead of the root
@@ -10784,17 +10786,32 @@ def _default_spawn(
     env["HERMES_SESSION_SOURCE"] = "kanban"
     # Pin TERMINAL_CWD to the task's workspace so the worker's file tools and
     # context-file loader anchor on the workspace, not whatever cwd the
-    # dispatching gateway happened to export. The worker subprocess is already
-    # launched with cwd=workspace, but TERMINAL_CWD takes precedence over the
-    # process cwd in both file_tools._resolve_base_dir (#41312 — relative
-    # write_file paths were landing in the gateway user's home) and
-    # build_context_files_prompt (#34619 — workers loaded the dispatching
-    # gateway's AGENTS.md instead of the task's). Setting it to the workspace
-    # fixes both: the workspace is where the task's work actually happens.
+    # dispatching gateway happened to export. For remote SSH workers, the
+    # dispatcher's local workspace does not exist on the execution target, so
+    # keep the profile's configured remote cwd instead of injecting a host path.
     # Only pin a real, absolute directory — file_tools rejects relative /
     # sentinel TERMINAL_CWD values, so a non-dir workspace must NOT be set
-    # here (leave the inherited value rather than write a meaningless one).
-    if workspace and os.path.isabs(workspace) and os.path.isdir(workspace):
+    # here (leave the inherited/profile value rather than write nonsense).
+    _worker_backend = ""
+    try:
+        import yaml as _yaml
+
+        _worker_cfg = _yaml.safe_load(
+            Path(env.get("HERMES_HOME", "")).joinpath("config.yaml").read_text(
+                encoding="utf-8"
+            )
+        ) or {}
+        _worker_backend = str(
+            (_worker_cfg.get("terminal") or {}).get("backend") or ""
+        ).strip().lower()
+    except Exception:
+        _worker_backend = ""
+    if (
+        _worker_backend != "ssh"
+        and workspace
+        and os.path.isabs(workspace)
+        and os.path.isdir(workspace)
+    ):
         env["TERMINAL_CWD"] = workspace
     if task.branch_name:
         env["HERMES_KANBAN_BRANCH"] = task.branch_name

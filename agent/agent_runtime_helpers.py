@@ -4393,11 +4393,52 @@ def looks_like_codex_intermediate_ack(
     is ``true`` or a model-list), so general autonomous workflows ("I'll run a
     health check on the server", "I'll start the deployment") — which carry a
     future-ack and an action verb but no filesystem reference — are caught too.
-    The future-ack + short-content + no-prior-tools + action-verb requirements
-    always apply, which is what keeps conversational "I'll help you brainstorm"
-    replies from tripping it.
+    The future-ack + short-content + no-substantive-current-turn-tools +
+    action-verb requirements always apply, which is what keeps conversational
+    "I'll help you brainstorm" replies from tripping it. Read-only discovery
+    tools such as ``skill_view`` do not count as execution: if the assistant
+    loads instructions and then merely announces the real action, the loop must
+    keep going so it can call the operational tool.
     """
-    if any(isinstance(msg, dict) and msg.get("role") == "tool" for msg in messages):
+    # Only tool calls in the current user turn are relevant. A historical tool
+    # result must not suppress continuation for a later request. Preparatory
+    # discovery tools load instructions/capabilities but do not perform the
+    # requested operation, so they also must not suppress continuation.
+    latest_user_index = -1
+    for index, message in enumerate(messages):
+        if isinstance(message, dict) and message.get("role") == "user":
+            latest_user_index = index
+
+    current_turn = messages[latest_user_index + 1 :]
+    tool_names_by_call_id: Dict[str, str] = {}
+    current_turn_tool_names: List[str] = []
+
+    for message in current_turn:
+        if not isinstance(message, dict):
+            continue
+        if message.get("role") == "assistant":
+            for tool_call in message.get("tool_calls") or []:
+                if not isinstance(tool_call, dict):
+                    continue
+                call_id = str(tool_call.get("id") or "")
+                function = tool_call.get("function") or {}
+                tool_name = function.get("name") if isinstance(function, dict) else None
+                if tool_name:
+                    normalized = str(tool_name).lower().rsplit(".", 1)[-1]
+                    current_turn_tool_names.append(normalized)
+                    if call_id:
+                        tool_names_by_call_id[call_id] = normalized
+        elif message.get("role") == "tool":
+            tool_name = message.get("name")
+            if not tool_name:
+                tool_name = tool_names_by_call_id.get(str(message.get("tool_call_id") or ""))
+            # Unknown tool results are conservatively substantive.
+            current_turn_tool_names.append(
+                str(tool_name).lower().rsplit(".", 1)[-1] if tool_name else "<unknown>"
+            )
+
+    preparatory_tools = {"skill_view", "skills_list", "tool_search"}
+    if any(name not in preparatory_tools for name in current_turn_tool_names):
         return False
 
     assistant_text = agent._strip_think_blocks(assistant_content or "").strip().lower()
@@ -4429,6 +4470,14 @@ def looks_like_codex_intermediate_ack(
         "debug",
         "search",
         "find",
+        "make the call",
+        "invoke",
+        "trigger",
+        "retrieve",
+        "download",
+        "unlock",
+        "sign in",
+        "pull",
         "walkthrough",
         "report back",
         "summarize",

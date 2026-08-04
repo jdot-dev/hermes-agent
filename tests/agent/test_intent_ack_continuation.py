@@ -125,3 +125,82 @@ def test_all_path_drops_workspace_requirement():
 
 
 
+def test_historical_tool_does_not_suppress_a_later_user_turn():
+    a = _agent(True, "chat_completions")
+    msgs = [
+        {"role": "user", "content": "check the old service"},
+        {"role": "tool", "name": "terminal", "content": "old result"},
+        {"role": "assistant", "content": "The old service is healthy."},
+        {"role": "user", "content": REPRO_USER},
+    ]
+    assert looks_like_codex_intermediate_ack(
+        a, REPRO_USER, REPRO_ACK, msgs, require_workspace=False
+    )
+
+
+def test_skill_view_is_preparatory_and_does_not_suppress_execution():
+    a = _agent(True, "chat_completions")
+    msgs = [
+        {"role": "user", "content": "load the credential skill and retrieve the token"},
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {
+                    "id": "call-skill",
+                    "type": "function",
+                    "function": {"name": "skill_view", "arguments": "{}"},
+                }
+            ],
+        },
+        {
+            "role": "tool",
+            "tool_call_id": "call-skill",
+            "name": "skill_view",
+            "content": "credential instructions",
+        },
+    ]
+    ack = "Let me make the call to retrieve the configured credential now."
+    assert looks_like_codex_intermediate_ack(
+        a,
+        "load the credential skill and retrieve the token",
+        ack,
+        msgs,
+        require_workspace=False,
+    )
+
+
+def test_terminal_remains_a_substantive_current_turn_tool():
+    a = _agent(True, "chat_completions")
+    msgs = [
+        {"role": "user", "content": REPRO_USER},
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {
+                    "id": "call-terminal",
+                    "type": "function",
+                    "function": {"name": "terminal", "arguments": "{}"},
+                }
+            ],
+        },
+        {
+            "role": "tool",
+            "tool_call_id": "call-terminal",
+            "name": "terminal",
+            "content": "health check result",
+        },
+    ]
+    assert not looks_like_codex_intermediate_ack(
+        a, REPRO_USER, REPRO_ACK, msgs, require_workspace=False
+    )
+
+
+def test_long_response_is_not_treated_as_an_ack():
+    a = _agent(True, "chat_completions")
+    long_ack = "I will run the check. " + ("x" * 1300)
+    msgs = [{"role": "user", "content": REPRO_USER}]
+    assert not looks_like_codex_intermediate_ack(
+        a, REPRO_USER, long_ack, msgs, require_workspace=False
+    )

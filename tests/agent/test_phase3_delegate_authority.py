@@ -664,7 +664,11 @@ def _wire_delegate_tool(monkeypatch, tmp_path, store, children, *, enforce=True)
     monkeypatch.setattr(
         delegation_live_log,
         "create_live_transcripts",
-        lambda task_list, context: ("deleg-test", [None] * len(task_list), []),
+        lambda task_list, context, **_kwargs: (
+            "deleg-test",
+            [None] * len(task_list),
+            [],
+        ),
     )
     monkeypatch.setattr(
         delegation_live_log, "update_manifest_statuses", lambda *a, **kw: None
@@ -1766,7 +1770,7 @@ def test_flags_off_canonical_delegation_still_runs_without_authority(monkeypatch
 
     payload = json.loads(
         delegate_tool.delegate_task(
-            tasks=[{"goal": CHILD_GOAL, "role": "leaf"}], parent_agent=parent_agent
+            goal=CHILD_GOAL, role="leaf", parent_agent=parent_agent
         )
     )
 

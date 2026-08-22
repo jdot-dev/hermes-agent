@@ -3782,6 +3782,10 @@ def delegate_task(
             role=role,
             route=route,
             background=background,
+            output_schema=output_schema,
+            action=action,
+            subagent_id=subagent_id,
+            message=message,
             parent_agent=parent_agent,
             _authority_box=authority_box,
         )
@@ -3802,6 +3806,10 @@ def _delegate_task_impl(
     role: Optional[str] = None,
     route: Optional[str] = None,
     background: Optional[bool] = None,
+    output_schema: Optional[Dict[str, Any]] = None,
+    action: Optional[str] = None,
+    subagent_id: Optional[str] = None,
+    message: Optional[str] = None,
     parent_agent=None,
     _authority_box: Optional[Dict[str, Any]] = None,
 ) -> str:

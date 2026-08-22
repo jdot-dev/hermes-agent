@@ -194,10 +194,10 @@ def main() -> int:
     result = evaluate(args.receipts, args.after_id)
     rendered = json.dumps(result, indent=2, sort_keys=True) + "\n"
     args.output.parent.mkdir(parents=True, exist_ok=True)
-    args.output.write_text(rendered)
+    args.output.write_text(rendered, encoding="utf-8")
     digest = hashlib.sha256(rendered.encode()).hexdigest()
     args.output.with_suffix(args.output.suffix + ".sha256").write_text(
-        f"{digest}  {args.output.name}\n"
+        f"{digest}  {args.output.name}\n", encoding="utf-8"
     )
     print(
         json.dumps(

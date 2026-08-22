@@ -293,10 +293,17 @@ class TestDelegationDefaultToolsets(unittest.TestCase):
         )
         self.assertEqual(kwargs["enabled_toolsets"], ["file"])
 
+    def test_configured_list_is_a_ceiling_over_inherited_mcp_toolsets(self):
+        kwargs = self._build(
+            {"default_toolsets": ["file"], "inherit_mcp_toolsets": True},
+            ["terminal", "file", "mcp-qdrant"],
+        )
+        self.assertEqual(kwargs["enabled_toolsets"], ["file"])
+
     def test_configured_empty_list_enables_no_child_toolsets(self):
         kwargs = self._build(
             {"default_toolsets": []},
-            ["terminal", "file", "web"],
+            ["terminal", "file", "web", "mcp-qdrant"],
         )
         self.assertEqual(kwargs["enabled_toolsets"], [])
 

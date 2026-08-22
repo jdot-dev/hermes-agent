@@ -111,25 +111,6 @@ from utils import base_url_host_matches, env_var_enabled
 logger = logging.getLogger(__name__)
 
 
-class Phase2ModelDispatchBlocked(RuntimeError):
-    """Provider dispatch was denied by the bound Phase 2 node authority."""
-
-    def __init__(self, decision) -> None:
-        super().__init__(decision.message)
-        self.decision = decision
-
-
-def _phase2_authorized_model_dispatch(dispatch):
-    """Run one provider call only after its direct-model node authorizes it."""
-
-    from agent.phase2_enforcement import evaluate_runtime_authority
-
-    decision = evaluate_runtime_authority()
-    if decision is not None:
-        raise Phase2ModelDispatchBlocked(decision)
-    return dispatch()
-
-
 # Scaffold marker used by _apply_active_turn_redirect and the ghost-row filter
 # in the api_messages loop. Module-level so both sites can never drift.
 _INTERRUPT_SCAFFOLD_MARKER = "[This response was interrupted by a user correction.]"
@@ -338,6 +319,25 @@ def _phase2_authorized_model_dispatch(dispatch):
 
 # Stable prefix of the local interrupt status string emitted when a turn is
 # cancelled while waiting on the provider. Surfaces (ACP, TUI) match on this
+class Phase2ModelDispatchBlocked(RuntimeError):
+    """Provider dispatch was denied by the bound Phase 2 node authority."""
+
+    def __init__(self, decision) -> None:
+        super().__init__(decision.message)
+        self.decision = decision
+
+
+def _phase2_authorized_model_dispatch(dispatch):
+    """Run one provider call only after its direct-model node authorizes it."""
+
+    from agent.phase2_enforcement import evaluate_runtime_authority
+
+    decision = evaluate_runtime_authority()
+    if decision is not None:
+        raise Phase2ModelDispatchBlocked(decision)
+    return dispatch()
+
+
 # to treat it as cancellation metadata rather than assistant prose.
 INTERRUPT_WAITING_FOR_MODEL_PREFIX = "Operation interrupted: waiting for model response ("
 
@@ -3367,7 +3367,6 @@ def run_conversation(
                             is_github_responses=agent._is_copilot_url(),
                             sanitize_harmony_tokens=agent._is_codex_backend(),
                         )
-
                     def _dispatch_model_call(prepared_api_kwargs):
                         def _dispatch():
                             def _provider_dispatch():
@@ -4578,6 +4577,14 @@ def run_conversation(
                             # advisor cost (each priced at its own rate). Folded
                             # here so state.db's estimated_cost_usd includes the
                             # full MoA spend, matching the folded token counts.
+                            _cost_delta = None
+                            if cost_result.amount_usd is not None:
+                                _cost_delta = float(cost_result.amount_usd)
+                            if _moa_ref_cost is not None:
+                                try:
+                                    _cost_delta = (_cost_delta or 0.0) + float(_moa_ref_cost)
+                                except (TypeError, ValueError):  # pragma: no cover
+                                    pass
                             # Enqueued, not written: the background writer
                             # applies the delta off the turn thread (a cold
                             # state.db UPDATE here stalled the tool loop for

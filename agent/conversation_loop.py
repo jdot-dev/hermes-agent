@@ -111,6 +111,25 @@ from utils import base_url_host_matches, env_var_enabled
 logger = logging.getLogger(__name__)
 
 
+class Phase2ModelDispatchBlocked(RuntimeError):
+    """Provider dispatch was denied by the bound Phase 2 node authority."""
+
+    def __init__(self, decision) -> None:
+        super().__init__(decision.message)
+        self.decision = decision
+
+
+def _phase2_authorized_model_dispatch(dispatch):
+    """Run one provider call only after its direct-model node authorizes it."""
+
+    from agent.phase2_enforcement import evaluate_runtime_authority
+
+    decision = evaluate_runtime_authority()
+    if decision is not None:
+        raise Phase2ModelDispatchBlocked(decision)
+    return dispatch()
+
+
 # Scaffold marker used by _apply_active_turn_redirect and the ghost-row filter
 # in the api_messages loop. Module-level so both sites can never drift.
 _INTERRUPT_SCAFFOLD_MARKER = "[This response was interrupted by a user correction.]"
@@ -3348,6 +3367,7 @@ def run_conversation(
                             is_github_responses=agent._is_copilot_url(),
                             sanitize_harmony_tokens=agent._is_codex_backend(),
                         )
+
                     def _dispatch_model_call(prepared_api_kwargs):
                         def _dispatch():
                             def _provider_dispatch():
@@ -4511,6 +4531,20 @@ def run_conversation(
                         base_url=_agg_cost_base_url,
                         api_key=getattr(agent, "api_key", ""),
                     )
+                    _cost_delta = None
+                    if cost_result.amount_usd is not None:
+                        _cost_delta = float(cost_result.amount_usd)
+                        if _moa_ref_cost is not None:
+                            try:
+                                _cost_delta += float(_moa_ref_cost)
+                            except (TypeError, ValueError):
+                                _cost_delta = None
+
+                    # Charge usage only after MoA advisor usage has been folded
+                    # in. Unknown aggregate spend poisons the sealed USD budget.
+                    from agent.phase2_enforcement import record_budget_usage
+
+                    record_budget_usage(tokens=total_tokens, usd=_cost_delta)
                     if cost_result.amount_usd is not None:
                         agent.session_estimated_cost_usd += float(cost_result.amount_usd)
                     # Add MoA advisor cost (already priced per-advisor at each
@@ -4544,14 +4578,6 @@ def run_conversation(
                             # advisor cost (each priced at its own rate). Folded
                             # here so state.db's estimated_cost_usd includes the
                             # full MoA spend, matching the folded token counts.
-                            _cost_delta = None
-                            if cost_result.amount_usd is not None:
-                                _cost_delta = float(cost_result.amount_usd)
-                            if _moa_ref_cost is not None:
-                                try:
-                                    _cost_delta = (_cost_delta or 0.0) + float(_moa_ref_cost)
-                                except (TypeError, ValueError):  # pragma: no cover
-                                    pass
                             # Enqueued, not written: the background writer
                             # applies the delta off the turn thread (a cold
                             # state.db UPDATE here stalled the tool loop for

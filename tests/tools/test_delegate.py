@@ -462,7 +462,8 @@ class TestDelegationRoutes(unittest.TestCase):
         }
         result = json.loads(
             delegate_task(
-                tasks=[{"goal": "work", "route": "attacker/provider-model"}],
+                goal="work",
+                route="attacker/provider-model",
                 parent_agent=_make_mock_parent(),
             )
         )
@@ -554,8 +555,8 @@ class TestDelegationRoutes(unittest.TestCase):
             result = json.loads(
                 delegate_task(
                     tasks=[
-                        {"goal": "local", "route": "local"},
-                        {"goal": "hosted", "route": "hosted"},
+                        {"goal": "Run work through the local route", "route": "local"},
+                        {"goal": "Run work through the hosted route", "route": "hosted"},
                     ],
                     background=True,
                     parent_agent=parent,

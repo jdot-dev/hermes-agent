@@ -1766,7 +1766,7 @@ def test_flags_off_canonical_delegation_still_runs_without_authority(monkeypatch
 
     payload = json.loads(
         delegate_tool.delegate_task(
-            tasks=[{"goal": CHILD_GOAL, "role": "leaf"}], parent_agent=parent_agent
+            goal=CHILD_GOAL, role="leaf", parent_agent=parent_agent
         )
     )
 

@@ -254,7 +254,7 @@ def test_bound_v2_authority_is_the_receipted_envelope(db_path, monkeypatch):
 def test_receipt_hashes_raw_tool_output_before_guardrail_annotation(db_path, monkeypatch):
     _set_receipts_enabled(monkeypatch, True)
     agent = _make_agent()
-    def annotate(function_name, function_args, result, *, failed):
+    def annotate(function_name, function_args, result, *, failed, tool_call_id=None):
         return result + "-ANNOTATED"
 
     monkeypatch.setattr(agent, "_append_guardrail_observation", annotate)
@@ -464,7 +464,7 @@ def test_concurrent_submit_skipped_before_worker_start_produces_no_receipt(
     assert "was not started" in messages[0]["content"]
 
 
-def test_concurrent_running_future_crossing_timeout_still_gets_one_receipt(
+def test_concurrent_future_abandoned_before_dispatch_gets_no_receipt(
     db_path, monkeypatch
 ):
     _set_receipts_enabled(monkeypatch, True)
@@ -492,12 +492,7 @@ def test_concurrent_running_future_crossing_timeout_still_gets_one_receipt(
     release_worker.set()
     assert worker_finished.wait(2)
 
-    deadline = time.monotonic() + 2
-    while time.monotonic() < deadline and len(_receipts(db_path)) != 1:
-        time.sleep(0.01)
-    rows = _receipts(db_path)
-    assert len(rows) == 1
-    assert rows[0]["tool_call_id"] == "late-start"
+    assert _receipts(db_path) == []
 
 
 def test_concurrent_started_wedged_call_gets_timeout_receipt_before_worker_returns(

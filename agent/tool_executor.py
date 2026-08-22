@@ -333,64 +333,6 @@ def _emit_terminal_post_tool_call(
         pass
 
 
-def _maybe_record_action_receipt(
-    agent,
-    *,
-    function_name: str,
-    function_args: Any,
-    result: Any,
-    effective_task_id: str,
-    tool_call_id: str,
-    duration_s: float,
-    exit_status: str,
-) -> None:
-    """Record one best-effort receipt for a tool call that actually ran."""
-    try:
-        from agent.action_receipts import ActionReceiptLedger, is_enabled
-
-        if not is_enabled():
-            return
-
-        from agent.phase2_enforcement import current_sealed_envelope
-        from agent.task_envelope import build_shadow_envelope
-
-        try:
-            cwd = getattr(get_active_env(effective_task_id), "cwd", None)
-        except Exception:
-            cwd = None
-
-        session_id = getattr(agent, "session_id", "") or None
-        envelope = current_sealed_envelope()
-        if envelope is None:
-            envelope = build_shadow_envelope(
-                tool_name=function_name,
-                args=function_args,
-                cwd=str(cwd) if cwd else None,
-                session_id=session_id,
-                task_id=effective_task_id or None,
-                tool_call_id=tool_call_id or None,
-            )
-        receipt_cwd = (
-            getattr(envelope, "cwd", None)
-            if not isinstance(envelope, Mapping)
-            else str(cwd) if cwd else None
-        )
-        ActionReceiptLedger().record_receipt(
-            tool_name=function_name,
-            args=function_args,
-            output=result,
-            exit_status=exit_status,
-            duration_ms=int(duration_s * 1000),
-            session_id=session_id,
-            task_id=effective_task_id or None,
-            tool_call_id=tool_call_id or None,
-            cwd=receipt_cwd,
-            envelope=envelope,
-        )
-    except Exception as exc:
-        logger.warning("action receipt write failed for %s: %s", function_name, exc)
-
-
 def _cancelled_tool_result(reason: str = "user interrupt") -> str:
     return json.dumps(
         {
@@ -458,6 +400,7 @@ def _maybe_record_action_receipt(
         if not is_enabled():
             return
 
+        from agent.phase2_enforcement import current_sealed_envelope
         from agent.task_envelope import build_shadow_envelope
 
         try:
@@ -466,14 +409,16 @@ def _maybe_record_action_receipt(
             cwd = None
 
         session_id = getattr(agent, "session_id", "") or None
-        envelope = build_shadow_envelope(
-            tool_name=function_name,
-            args=function_args,
-            cwd=str(cwd) if cwd else None,
-            session_id=session_id,
-            task_id=effective_task_id or None,
-            tool_call_id=tool_call_id or None,
-        )
+        envelope = current_sealed_envelope()
+        if envelope is None:
+            envelope = build_shadow_envelope(
+                tool_name=function_name,
+                args=function_args,
+                cwd=str(cwd) if cwd else None,
+                session_id=session_id,
+                task_id=effective_task_id or None,
+                tool_call_id=tool_call_id or None,
+            )
         receipt_cwd = (
             getattr(envelope, "cwd", None)
             if not isinstance(envelope, Mapping)
@@ -996,7 +941,6 @@ def _run_agent_tool_execution_middleware(
             name=f"tool-activity-hb-{function_name[:24]}",
         )
         _hb_thread.start()
-        dispatch_started_at = time.time()
         try:
             result = execute(final_args)
             from agent.phase2_enforcement import rebind_delegated_execution_authority

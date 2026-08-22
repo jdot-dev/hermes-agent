@@ -1788,12 +1788,14 @@ def _build_child_agent(
     # leaf children no enabled toolsets.
     configured_default_toolsets = delegation_cfg.get("default_toolsets")
     if toolsets is None and isinstance(configured_default_toolsets, list):
+        using_configured_default_toolsets = True
         requested_toolsets: Optional[List[str]] = [
             item.strip()
             for item in configured_default_toolsets
             if isinstance(item, str) and item.strip()
         ]
     else:
+        using_configured_default_toolsets = False
         requested_toolsets = toolsets
 
     if requested_toolsets is not None:
@@ -1802,7 +1804,11 @@ def _build_child_agent(
         # toolset names (e.g. web, terminal) are recognised during intersection.
         expanded_parent = _expand_parent_toolsets(parent_toolsets)
         child_toolsets = [t for t in requested_toolsets if t in expanded_parent]
-        if _get_inherit_mcp_toolsets():
+        # An operator-owned default is a hard ceiling over every toolset,
+        # including MCP. Preserve legacy MCP inheritance only for explicit
+        # per-child narrowing; otherwise an omitted MCP name would silently
+        # widen the configured ceiling.
+        if not using_configured_default_toolsets and _get_inherit_mcp_toolsets():
             child_toolsets = _preserve_parent_mcp_toolsets(
                 child_toolsets, parent_toolsets
             )

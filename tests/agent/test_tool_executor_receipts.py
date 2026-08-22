@@ -192,7 +192,7 @@ def test_enabled_sequential_writes_exactly_one_receipt_per_call(db_path, monkeyp
 def test_receipt_hashes_raw_tool_output_before_guardrail_annotation(db_path, monkeypatch):
     _set_receipts_enabled(monkeypatch, True)
     agent = _make_agent()
-    def annotate(function_name, function_args, result, *, failed):
+    def annotate(function_name, function_args, result, *, failed, tool_call_id=""):
         return result + "-ANNOTATED"
 
     monkeypatch.setattr(agent, "_append_guardrail_observation", annotate)

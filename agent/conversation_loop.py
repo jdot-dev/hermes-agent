@@ -226,25 +226,6 @@ _HANDOFF_SKIP_FINAL_RESPONSE = (
 
 # Stable prefix of the local interrupt status string emitted when a turn is
 # cancelled while waiting on the provider. Surfaces (ACP, TUI) match on this
-class Phase2ModelDispatchBlocked(RuntimeError):
-    """Provider dispatch was denied by the bound Phase 2 node authority."""
-
-    def __init__(self, decision) -> None:
-        super().__init__(decision.message)
-        self.decision = decision
-
-
-def _phase2_authorized_model_dispatch(dispatch):
-    """Run one provider call only after its direct-model node authorizes it."""
-
-    from agent.phase2_enforcement import evaluate_runtime_authority
-
-    decision = evaluate_runtime_authority()
-    if decision is not None:
-        raise Phase2ModelDispatchBlocked(decision)
-    return dispatch()
-
-
 # to treat it as cancellation metadata rather than assistant prose.
 INTERRUPT_WAITING_FOR_MODEL_PREFIX = "Operation interrupted: waiting for model response ("
 
@@ -1967,21 +1948,6 @@ def run_conversation(
     # See agent/transports/codex_app_server_session.py for the adapter
     # and references/codex-app-server-runtime.md for the rationale.
     if agent.api_mode == "codex_app_server":
-        from agent.phase2_enforcement import EnforcementBlock, is_enabled
-
-        if is_enabled():
-            _surface_block = EnforcementBlock(
-                "execution_surface_not_enforceable",
-                "Codex app-server bypasses Hermes tool seams and is unavailable under Phase 2 enforcement",
-            )
-            return {
-                "final_response": json.dumps(_surface_block.to_dict(), ensure_ascii=False),
-                "messages": messages,
-                "api_calls": 0,
-                "completed": False,
-                "failed": True,
-                "error": _surface_block.code,
-            }
         return agent._run_codex_app_server_turn(
             user_message=user_message,
             original_user_message=original_user_message,
@@ -2012,18 +1978,6 @@ def run_conversation(
                 agent._safe_print("\n⚡ Breaking out of tool loop due to interrupt...")
             break
 
-        # Revalidate direct-model authority before each loop iteration. The
-        # dispatch wrapper repeats this check immediately before provider I/O.
-        from agent.phase2_enforcement import evaluate_runtime_authority
-
-        _phase2_runtime_block = evaluate_runtime_authority()
-        if _phase2_runtime_block is not None:
-            final_response = json.dumps(_phase2_runtime_block.to_dict(), ensure_ascii=False)
-            failed = True
-            _turn_exit_reason = f"phase2_{_phase2_runtime_block.code}"
-            messages.append({"role": "assistant", "content": final_response})
-            break
-        
         api_call_count += 1
         agent._api_call_count = api_call_count
         agent._touch_activity(f"starting API call #{api_call_count}")
@@ -3172,7 +3126,7 @@ def run_conversation(
                                 defer_logical_completion=True,
                             )
 
-                        return _phase2_authorized_model_dispatch(_dispatch)
+                        return _dispatch()
 
                     from agent.model_call_shadow import run_model_call_shadow
 
@@ -4280,11 +4234,6 @@ def run_conversation(
                             except (TypeError, ValueError):
                                 _cost_delta = None
 
-                    # Charge usage only after MoA advisor usage has been folded
-                    # in. Unknown aggregate spend poisons the sealed USD budget.
-                    from agent.phase2_enforcement import record_budget_usage
-
-                    record_budget_usage(tokens=total_tokens, usd=_cost_delta)
                     if cost_result.amount_usd is not None:
                         agent.session_estimated_cost_usd += float(cost_result.amount_usd)
                     # Add MoA advisor cost (already priced per-advisor at each

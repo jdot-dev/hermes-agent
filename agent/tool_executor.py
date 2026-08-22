@@ -400,7 +400,6 @@ def _maybe_record_action_receipt(
         if not is_enabled():
             return
 
-        from agent.phase2_enforcement import current_sealed_envelope
         from agent.task_envelope import build_shadow_envelope
 
         try:
@@ -409,16 +408,14 @@ def _maybe_record_action_receipt(
             cwd = None
 
         session_id = getattr(agent, "session_id", "") or None
-        envelope = current_sealed_envelope()
-        if envelope is None:
-            envelope = build_shadow_envelope(
-                tool_name=function_name,
-                args=function_args,
-                cwd=str(cwd) if cwd else None,
-                session_id=session_id,
-                task_id=effective_task_id or None,
-                tool_call_id=tool_call_id or None,
-            )
+        envelope = build_shadow_envelope(
+            tool_name=function_name,
+            args=function_args,
+            cwd=str(cwd) if cwd else None,
+            session_id=session_id,
+            task_id=effective_task_id or None,
+            tool_call_id=tool_call_id or None,
+        )
         receipt_cwd = (
             getattr(envelope, "cwd", None)
             if not isinstance(envelope, Mapping)
@@ -719,6 +716,7 @@ def _run_tool_activity_heartbeat(
     except Exception:
         # A heartbeat must never break the agent loop.
         pass
+
 
 
 def _run_agent_tool_execution_middleware(
@@ -1485,6 +1483,7 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
             (tool_call, function_name, function_args, [], None, _ts_scope_block)
         )
 
+
     # ── Logging / callbacks ──────────────────────────────────────────
     tool_names_str = ", ".join(name for _, name, _, _, _, _ in parsed_calls)
     if not agent.quiet_mode and getattr(agent, "tool_progress_mode", "all") != "off":
@@ -1979,6 +1978,7 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                         # fan-out so none of them wakes up later and dispatches
                         # a tool this loop just reported as timed out.
                         _abandon_batch()
+
                         with agent._tool_worker_threads_lock:
                             worker_tids = list(agent._tool_worker_threads)
                         for tid in worker_tids:
@@ -2002,11 +2002,15 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                                 f"{len(not_done)} pending concurrent tool(s)",
                                 force=True,
                             )
+                        # Cancel any futures that haven't started yet so we
+                        # don't block on them; a running worker notices the
+                        # per-thread interrupt below.
                         for f in not_done:
                             f.cancel()
                         # Release gate-parked workers so they abort instead of
                         # dispatching after the turn was already interrupted.
                         _abandon_batch()
+
                         # Give already-running tools a moment to notice the
                         # per-thread interrupt signal and exit gracefully.
                         concurrent.futures.wait(not_done, timeout=3.0)
@@ -2459,6 +2463,7 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
         tool_start_time = time.time()
 
         if function_name == "todo":
+
             def _execute(next_args: dict) -> Any:
                 from tools.todo_tool import todo_tool as _todo_tool
                 return _todo_tool(

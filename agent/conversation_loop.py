@@ -298,8 +298,6 @@ _HANDOFF_SKIP_FINAL_RESPONSE = (
 )
 
 
-# Stable prefix of the local interrupt status string emitted when a turn is
-# cancelled while waiting on the provider. Surfaces (ACP, TUI) match on this
 class Phase2ModelDispatchBlocked(RuntimeError):
     """Provider dispatch was denied by the bound Phase 2 node authority."""
 
@@ -319,6 +317,8 @@ def _phase2_authorized_model_dispatch(dispatch):
     return dispatch()
 
 
+# Stable prefix of the local interrupt status string emitted when a turn is
+# cancelled while waiting on the provider. Surfaces (ACP, TUI) match on this
 # to treat it as cancellation metadata rather than assistant prose.
 INTERRUPT_WAITING_FOR_MODEL_PREFIX = "Operation interrupted: waiting for model response ("
 
@@ -2174,6 +2174,7 @@ def run_conversation(
             messages.append({"role": "assistant", "content": final_response})
             break
         
+
         api_call_count += 1
         agent._api_call_count = api_call_count
         agent._touch_activity(f"starting API call #{api_call_count}")
@@ -3349,34 +3350,40 @@ def run_conversation(
                         )
                     def _dispatch_model_call(prepared_api_kwargs):
                         def _dispatch():
-                            if _use_streaming:
-                                return agent._interruptible_streaming_api_call(
-                                    prepared_api_kwargs, on_first_delta=_stop_spinner
-                                )
-                            from agent import relay_llm
+                            def _provider_dispatch():
+                                if _use_streaming:
+                                    return agent._interruptible_streaming_api_call(
+                                        prepared_api_kwargs,
+                                        on_first_delta=_stop_spinner,
+                                    )
+                                from agent import relay_llm
 
-                            return relay_llm.execute(
-                                prepared_api_kwargs,
-                                agent._interruptible_api_call,
-                                session_id=str(agent.session_id or ""),
-                                name=str(agent.provider or "provider"),
-                                model_name=str(agent.model or ""),
-                                metadata={
-                                    "api_mode": agent.api_mode,
-                                    "api_request_id": api_request_id,
-                                    "call_role": (
-                                        "delegated"
-                                        if getattr(agent, "is_subagent", False)
-                                        else "fallback"
-                                        if int(getattr(agent, "_fallback_index", 0) or 0) > 0
-                                        else "primary"
-                                    ),
-                                    "retry_count": retry_count,
-                                },
-                                defer_logical_completion=True,
+                                return relay_llm.execute(
+                                    prepared_api_kwargs,
+                                    agent._interruptible_api_call,
+                                    session_id=str(agent.session_id or ""),
+                                    name=str(agent.provider or "provider"),
+                                    model_name=str(agent.model or ""),
+                                    metadata={
+                                        "api_mode": agent.api_mode,
+                                        "api_request_id": api_request_id,
+                                        "call_role": (
+                                            "delegated"
+                                            if getattr(agent, "is_subagent", False)
+                                            else "fallback"
+                                            if int(getattr(agent, "_fallback_index", 0) or 0) > 0
+                                            else "primary"
+                                        ),
+                                        "retry_count": retry_count,
+                                    },
+                                    defer_logical_completion=True,
+                                )
+
+                            return _phase2_authorized_model_dispatch(
+                                _provider_dispatch
                             )
 
-                        return _phase2_authorized_model_dispatch(_dispatch)
+                        return _dispatch()
 
                     from agent.model_call_shadow import run_model_call_shadow
 
@@ -4513,11 +4520,6 @@ def run_conversation(
                             except (TypeError, ValueError):
                                 _cost_delta = None
 
-                    # Charge usage only after MoA advisor usage has been folded
-                    # in. Unknown aggregate spend poisons the sealed USD budget.
-                    from agent.phase2_enforcement import record_budget_usage
-
-                    record_budget_usage(tokens=total_tokens, usd=_cost_delta)
                     if cost_result.amount_usd is not None:
                         agent.session_estimated_cost_usd += float(cost_result.amount_usd)
                     # Add MoA advisor cost (already priced per-advisor at each

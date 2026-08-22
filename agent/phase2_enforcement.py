@@ -187,6 +187,22 @@ def current_authoritative_fence() -> int | None:
     return _CURRENT_FENCE.get()
 
 
+def rebind_delegated_execution_authority(
+    function_name: str, *, now: datetime | None = None
+) -> EnforcementBlock | None:
+    """Persist a middleware-authorized descendant binding in the caller context.
+
+    Execution middleware may invoke its callback in a copied context. Rebind the
+    same server-resolved descendant after that callback returns so subsequent
+    receipts and budget checks remain attached to the node that performed work.
+    """
+
+    delegation = _CURRENT_DELEGATION.get()
+    if delegation is None:
+        return None
+    return delegation.authorize(function_name, now=now or datetime.now(timezone.utc))
+
+
 def _action_id(envelope: Mapping[str, Any]) -> str:
     return ":".join(
         str(envelope[field]) for field in ("graph_id", "node_id", "attempt_id")

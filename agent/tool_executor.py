@@ -22,7 +22,7 @@ import threading
 import time
 from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import Any, Optional
+from typing import Any, Mapping, Optional
 
 from agent.display import (
     KawaiiSpinner,
@@ -313,6 +313,64 @@ def _emit_terminal_post_tool_call(
         pass
 
 
+def _maybe_record_action_receipt(
+    agent,
+    *,
+    function_name: str,
+    function_args: Any,
+    result: Any,
+    effective_task_id: str,
+    tool_call_id: str,
+    duration_s: float,
+    exit_status: str,
+) -> None:
+    """Record one best-effort receipt for a tool call that actually ran."""
+    try:
+        from agent.action_receipts import ActionReceiptLedger, is_enabled
+
+        if not is_enabled():
+            return
+
+        from agent.phase2_enforcement import current_sealed_envelope
+        from agent.task_envelope import build_shadow_envelope
+
+        try:
+            cwd = getattr(get_active_env(effective_task_id), "cwd", None)
+        except Exception:
+            cwd = None
+
+        session_id = getattr(agent, "session_id", "") or None
+        envelope = current_sealed_envelope()
+        if envelope is None:
+            envelope = build_shadow_envelope(
+                tool_name=function_name,
+                args=function_args,
+                cwd=str(cwd) if cwd else None,
+                session_id=session_id,
+                task_id=effective_task_id or None,
+                tool_call_id=tool_call_id or None,
+            )
+        receipt_cwd = (
+            getattr(envelope, "cwd", None)
+            if not isinstance(envelope, Mapping)
+            else str(cwd) if cwd else None
+        )
+        ActionReceiptLedger().record_receipt(
+            tool_name=function_name,
+            args=function_args,
+            output=result,
+            exit_status=exit_status,
+            duration_ms=int(duration_s * 1000),
+            session_id=session_id,
+            task_id=effective_task_id or None,
+            tool_call_id=tool_call_id or None,
+            cwd=receipt_cwd,
+            envelope=envelope,
+        )
+    except Exception as exc:
+        logger.warning("action receipt write failed for %s: %s", function_name, exc)
+
+
 def _cancelled_tool_result(reason: str = "user interrupt") -> str:
     return json.dumps(
         {
@@ -581,6 +639,79 @@ def _managed_values(
     )
 
 
+def _phase2_enforcement_block(
+    *,
+    function_name: str,
+    function_args: dict,
+    effective_task_id: str,
+) -> Optional[str]:
+    """Return a serialized fail-closed Phase 2 block, or ``None``."""
+    from agent import phase2_enforcement
+
+    try:
+        cwd = getattr(get_active_env(effective_task_id), "cwd", None)
+    except Exception:
+        cwd = None
+    destructive = (
+        function_name == "terminal"
+        and _is_destructive_command(str(function_args.get("command", "")))
+    )
+    try:
+        decision = phase2_enforcement.evaluate_tool_call(
+            function_name,
+            function_args,
+            cwd=str(cwd) if cwd else None,
+            destructive=destructive,
+        )
+    except Exception:
+        if not phase2_enforcement.is_enabled():
+            return None
+        logger.exception("Phase 2 envelope enforcement failed closed")
+        return json.dumps(
+            {
+                "error": "Task-envelope enforcement failed closed",
+                "status": "blocked",
+                "error_type": "envelope_enforcement_block",
+                "code": "enforcement_internal_error",
+                "details": [],
+            },
+            ensure_ascii=False,
+        )
+    return None if decision is None else json.dumps(decision.to_dict(), ensure_ascii=False)
+
+
+def _phase2_idempotency_block(
+    *, function_name: str, function_args: dict
+) -> Optional[str]:
+    """Atomically claim a mutating operation immediately before dispatch."""
+    from agent import phase2_enforcement
+
+    try:
+        decision = phase2_enforcement.claim_mutating_tool(function_name, function_args)
+    except Exception:
+        if not phase2_enforcement.is_enabled():
+            return None
+        logger.exception("Phase 2 idempotency claim failed closed")
+        decision = phase2_enforcement.EnforcementBlock(
+            "idempotency_internal_error",
+            "Phase 2 idempotency enforcement failed closed",
+        )
+    return None if decision is None else json.dumps(decision.to_dict(), ensure_ascii=False)
+
+
+def _serialized_phase2_block_error_type(block_message: str) -> str:
+    try:
+        payload = json.loads(block_message)
+    except (TypeError, ValueError):
+        return "envelope_enforcement_block"
+    code = payload.get("code") if isinstance(payload, dict) else None
+    return (
+        "idempotency_enforcement_block"
+        if code and "idempotency" in str(code)
+        else "envelope_enforcement_block"
+    )
+
+
 # Cadence for the in-flight tool activity heartbeat. Must stay far below the
 # gateway turn-inactivity timeout (default 1800s) so a silent-but-healthy
 # tool call never looks idle to the watchdog.
@@ -640,6 +771,7 @@ def _run_agent_tool_execution_middleware(
     authorization_gate: _ConcurrentToolAuthorizationGate | None = None,
     on_dispatch=None,
     cancel_receipt=True,
+    dispatch_observer=None,
 ) -> _ManagedToolResult:
     """Run Relay rewrites before Hermes policy and dispatch exactly once.
 
@@ -671,17 +803,18 @@ def _run_agent_tool_execution_middleware(
         "args": function_args,
         "middleware_trace": trace,
         "blocked": False,
+        "authorized": False,
         "dispatched": False,
     }
     dispatch_lock = threading.Lock()
 
     def _authorized_dispatch(final_args: dict[str, Any]) -> Any:
         with dispatch_lock:
-            if state["dispatched"]:
+            if state["authorized"]:
                 raise RuntimeError(
                     "Hermes tool execution callback invoked more than once"
                 )
-            state["dispatched"] = True
+            state["authorized"] = True
             state["blocked"] = False
             state["args"] = final_args
 
@@ -704,6 +837,16 @@ def _run_agent_tool_execution_middleware(
 
         block_message = scope_block
         block_error_type = "tool_scope_block"
+        if block_message is None:
+            block_message = _phase2_enforcement_block(
+                function_name=function_name,
+                function_args=final_args,
+                effective_task_id=effective_task_id,
+            )
+            block_error_type = _serialized_phase2_block_error_type(
+                block_message or ""
+            )
+
         if block_message is None:
             block_error_type = "plugin_block"
 
@@ -744,11 +887,34 @@ def _run_agent_tool_execution_middleware(
             if guardrail_decision.allows_execution:
                 guardrail_decision = None
 
+        start_order_advanced = False
+        if block_message is None and guardrail_decision is None:
+            # Mutating claims must follow model order. Otherwise concurrent
+            # workers race for the durable idempotency key and a later call can
+            # become the sole dispatch winner.
+            if begin_execution is not None:
+                _advance_start_order()
+                start_order_advanced = True
+            block_message = _phase2_idempotency_block(
+                function_name=function_name,
+                function_args=final_args,
+            )
+            if block_message is not None:
+                block_error_type = _serialized_phase2_block_error_type(block_message)
+
         if block_message is not None or guardrail_decision is not None:
             _advance_start_order()
             state["blocked"] = True
             if block_message is not None:
-                result = json.dumps({"error": block_message}, ensure_ascii=False)
+                try:
+                    parsed_block = json.loads(block_message)
+                except (TypeError, ValueError):
+                    parsed_block = None
+                result = (
+                    block_message
+                    if isinstance(parsed_block, dict)
+                    else json.dumps({"error": block_message}, ensure_ascii=False)
+                )
                 error_type = block_error_type
                 error_message = block_message
             else:
@@ -777,7 +943,13 @@ def _run_agent_tool_execution_middleware(
         elif function_name == "skill_manage":
             agent._iters_since_skill = 0
 
-        _advance_start_order(_begin)
+        if start_order_advanced:
+            _begin()
+        else:
+            _advance_start_order(_begin)
+        if dispatch_observer is not None:
+            dispatch_observer(final_args, list(state["middleware_trace"]))
+        state["dispatched"] = True
 
         # Past every preflight gate and past start-order abandonment: the tool
         # is about to run. Anything that keys on "this call actually started"
@@ -803,8 +975,51 @@ def _run_agent_tool_execution_middleware(
             name=f"tool-activity-hb-{function_name[:24]}",
         )
         _hb_thread.start()
+        dispatch_started_at = time.time()
         try:
-            return execute(final_args)
+            result = execute(final_args)
+        except KeyboardInterrupt:
+            _maybe_record_action_receipt(
+                agent,
+                function_name=function_name,
+                function_args=final_args,
+                result=_cancelled_tool_result(),
+                effective_task_id=effective_task_id,
+                tool_call_id=tool_call_id,
+                duration_s=time.time() - dispatch_started_at,
+                exit_status="cancelled",
+            )
+            raise
+        except Exception as exc:
+            _maybe_record_action_receipt(
+                agent,
+                function_name=function_name,
+                function_args=final_args,
+                result=str(exc),
+                effective_task_id=effective_task_id,
+                tool_call_id=tool_call_id,
+                duration_s=time.time() - dispatch_started_at,
+                exit_status="error",
+            )
+            raise
+        else:
+            from agent.phase2_enforcement import rebind_delegated_execution_authority
+
+            rebind_block = rebind_delegated_execution_authority(function_name)
+            if rebind_block is not None:
+                raise RuntimeError(rebind_block.message)
+            is_error, _ = _detect_tool_failure(function_name, result)
+            _maybe_record_action_receipt(
+                agent,
+                function_name=function_name,
+                function_args=final_args,
+                result=result,
+                effective_task_id=effective_task_id,
+                tool_call_id=tool_call_id,
+                duration_s=time.time() - dispatch_started_at,
+                exit_status="error" if is_error else "ok",
+            )
+            return result
         finally:
             _hb_stop.set()
             _hb_thread.join(timeout=2.0)
@@ -879,6 +1094,12 @@ def _run_agent_tool_execution_middleware(
                 exit_status="cancelled" if _cancelled else "error",
             )
         raise
+    if state["dispatched"]:
+        from agent.phase2_enforcement import rebind_delegated_execution_authority
+
+        rebind_block = rebind_delegated_execution_authority(function_name)
+        if rebind_block is not None:
+            raise RuntimeError(rebind_block.message)
     return _ManagedToolResult(
         result=result,
         args=state["args"],
@@ -1005,7 +1226,16 @@ def _run_sequential_tool_execution_middleware(
                     break
                 wait_slice = min(wait_slice, remaining)
             try:
-                return future.result(timeout=wait_slice)
+                outcome = future.result(timeout=wait_slice)
+                if outcome.dispatched:
+                    from agent.phase2_enforcement import (
+                        rebind_delegated_execution_authority,
+                    )
+
+                    rebind_block = rebind_delegated_execution_authority(function_name)
+                    if rebind_block is not None:
+                        raise RuntimeError(rebind_block.message)
+                return outcome
             except concurrent.futures.TimeoutError:
                 if agent._interrupt_requested:
                     interrupted = True
@@ -1326,6 +1556,7 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
     # ── Concurrent execution ─────────────────────────────────────────
     # Each slot holds (function_name, function_args, function_result, duration, error_flag, blocked_flag, middleware_trace)
     results = [None] * num_tools
+
     for i, (tc, name, args, middleware_trace, block_result, _scope_block) in enumerate(parsed_calls):
         if block_result is not None:
             results[i] = (name, args, block_result, 0.0, True, True, middleware_trace)
@@ -1482,6 +1713,14 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
         dispatched = False
         start_advanced = False
 
+        def _observe_dispatch(final_args, trace) -> None:
+            nonlocal dispatched, function_args, middleware_trace
+            dispatched = True
+            function_args = final_args
+            middleware_trace = trace
+            with receipt_state_lock:
+                started_indices.add(index)
+
         def _advance_start(callback=None) -> None:
             nonlocal start_advanced
             if start_advanced:
@@ -1527,8 +1766,8 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                     middleware_trace=middleware_trace,
                     begin_execution=_advance_start,
                     authorization_gate=authorization_gate,
-                    on_dispatch=lambda _args, _i=index: _mark_started(_i),
                     cancel_receipt=False,
+                    dispatch_observer=_observe_dispatch,
                 )
                 result = managed.result
                 function_args = managed.args
@@ -1562,7 +1801,7 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                 )
                 duration = time.time() - start
                 logger.info("tool %s cancelled (%.2fs)", function_name, duration)
-                if _claim_receipt(index):
+                if dispatched and _claim_receipt(index):
                     _maybe_record_action_receipt(
                         agent,
                         function_name=function_name,
@@ -1599,6 +1838,17 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                     middleware_trace=list(middleware_trace),
                 )
             is_error, _ = _detect_tool_failure(function_name, result)
+            if dispatched and _claim_receipt(index):
+                _maybe_record_action_receipt(
+                    agent,
+                    function_name=function_name,
+                    function_args=function_args,
+                    result=result,
+                    effective_task_id=effective_task_id,
+                    tool_call_id=getattr(tool_call, "id", "") or "",
+                    duration_s=duration,
+                    exit_status="error" if is_error else "ok",
+                )
             if is_error:
                 logger.info("tool %s failed (%.2fs): %s", function_name, duration, result[:200])
             else:

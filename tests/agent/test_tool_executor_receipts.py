@@ -349,7 +349,13 @@ def test_preflight_blocked_calls_produce_no_receipt(db_path, monkeypatch):
     _set_receipts_enabled(monkeypatch, True)
     agent = _make_agent()
 
-    with patch("hermes_cli.plugins.resolve_pre_tool_block", return_value="nope"):
+    # ``_dispatch_pre_tool_call_hooks`` is the executor's single pre_tool_call
+    # invocation point; ``resolve_pre_tool_block`` is a back-compat wrapper that
+    # this dispatch path does not go through.
+    with patch(
+        "hermes_cli.plugins._dispatch_pre_tool_call_hooks",
+        return_value=("nope", None),
+    ):
         seq_messages: list = []
         _run_sequential(agent, [_tool_call(call_id="c1")], seq_messages)
         conc_messages: list = []
@@ -402,9 +408,17 @@ def test_concurrent_submit_skipped_before_worker_start_produces_no_receipt(
     assert "was not started" in messages[0]["content"]
 
 
-def test_concurrent_running_future_crossing_timeout_still_gets_one_receipt(
+def test_concurrent_worker_abandoned_at_start_order_gate_produces_no_receipt(
     db_path, monkeypatch
 ):
+    """A worker whose thread starts after the batch deadline never dispatches.
+
+    ``_begin_in_order`` returns False for a batch the turn already abandoned and
+    the worker raises ``_BatchAbandoned`` *before* ``_authorized_dispatch``, so
+    the tool provably did not run. Attesting it would be a false receipt. The
+    started-then-wedged case — where the tool did run — is covered by
+    ``test_concurrent_started_wedged_call_gets_timeout_receipt_before_worker_returns``.
+    """
     _set_receipts_enabled(monkeypatch, True)
     agent = _make_agent()
     release_worker = threading.Event()
@@ -430,12 +444,12 @@ def test_concurrent_running_future_crossing_timeout_still_gets_one_receipt(
     release_worker.set()
     assert worker_finished.wait(2)
 
-    deadline = time.monotonic() + 2
-    while time.monotonic() < deadline and len(_receipts(db_path)) != 1:
+    # Give any late writer a window to prove itself wrong.
+    deadline = time.monotonic() + 0.5
+    while time.monotonic() < deadline and not _receipts(db_path):
         time.sleep(0.01)
-    rows = _receipts(db_path)
-    assert len(rows) == 1
-    assert rows[0]["tool_call_id"] == "late-start"
+    assert _receipts(db_path) == []
+    assert "timed out" in messages[0]["content"]
 
 
 def test_concurrent_started_wedged_call_gets_timeout_receipt_before_worker_returns(

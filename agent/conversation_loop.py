@@ -4511,15 +4511,6 @@ def run_conversation(
                         base_url=_agg_cost_base_url,
                         api_key=getattr(agent, "api_key", ""),
                     )
-                    _cost_delta = None
-                    if cost_result.amount_usd is not None:
-                        _cost_delta = float(cost_result.amount_usd)
-                        if _moa_ref_cost is not None:
-                            try:
-                                _cost_delta += float(_moa_ref_cost)
-                            except (TypeError, ValueError):
-                                _cost_delta = None
-
                     if cost_result.amount_usd is not None:
                         agent.session_estimated_cost_usd += float(cost_result.amount_usd)
                     # Add MoA advisor cost (already priced per-advisor at each

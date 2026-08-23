@@ -2108,6 +2108,11 @@ DEFAULT_CONFIG = {
         # extras" without silently stripping MCP tools the parent already has.
         # Set to false for strict intersection.
         "inherit_mcp_toolsets": True,
+        # Operator-owned child capability ceiling and named route presets.
+        # None preserves legacy parent inheritance; [] intentionally grants no
+        # enabled child toolsets. Route secrets should use ${ENV_VAR} expansion.
+        "default_toolsets": None,
+        "routes": {},
         "max_iterations": 250,  # per-subagent iteration cap (each subagent gets its own budget,
                                # independent of the parent's max_iterations)
         # Subagent summaries return to the parent's context verbatim. A batch

@@ -198,13 +198,13 @@ delegation:
     local:
       model: "qwen2.5-coder"
       base_url: "http://localhost:1234/v1"
-      api_key: "local-key"
+      api_key: ${LOCAL_ROUTER_API_KEY}
     hosted-fast:
       model: "google/gemini-flash-2.0"
       provider: "openrouter"
 ```
 
-Only valid configured names appear in the tool schema. Unknown names fail before credential resolution, and route entries may override only `model`, `provider`, `base_url`, `api_key`, and `api_mode`.
+Only valid configured names appear in the tool schema. Unknown names fail before credential resolution, and route entries may override only `model`, `provider`, `base_url`, `api_key`, and `api_mode`. Keep route secrets in environment variables and reference them with `${VAR_NAME}`; do not commit literal API keys.
 
 ## The `/review` Command
 

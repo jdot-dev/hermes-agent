@@ -1591,7 +1591,7 @@ delegation:
   #   local:
   #     model: "qwen2.5-coder"
   #     base_url: "http://localhost:1234/v1"
-  #     api_key: "local-key"
+  #     api_key: ${LOCAL_ROUTER_API_KEY}       # resolve secrets from the environment; do not commit literals
   #   hosted-fast:
   #     model: "google/gemini-flash-2.0"
   #     provider: "openrouter"

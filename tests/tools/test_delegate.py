@@ -31,6 +31,7 @@ from tools.delegate_tool import (
     _resolve_child_credential_pool,
     _resolve_delegation_credentials,
 )
+from hermes_cli.config_defaults import DEFAULT_CONFIG
 from hermes_state import SessionDB
 
 
@@ -285,6 +286,12 @@ class TestDelegationDefaultToolsets(unittest.TestCase):
     def test_absent_config_preserves_parent_inheritance(self):
         kwargs = self._build({}, ["terminal", "file", "web"])
         self.assertEqual(kwargs["enabled_toolsets"], ["terminal", "file", "web"])
+
+    def test_operator_route_and_toolset_defaults_are_registered(self):
+        delegation = DEFAULT_CONFIG["delegation"]
+        self.assertIsNone(delegation["default_toolsets"])
+        self.assertEqual(delegation["routes"], {})
+        self.assertIs(delegation["inherit_mcp_toolsets"], True)
 
     def test_configured_list_narrows_parent_capabilities(self):
         kwargs = self._build(

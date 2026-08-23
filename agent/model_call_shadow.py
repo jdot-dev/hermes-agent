@@ -1,4 +1,4 @@
-"""Default-off Phase 1 shadow correlation for OmniRoute model calls."""
+"""Default-off Phase 1 model-call correlation for explicitly configured routers."""
 
 from __future__ import annotations
 
@@ -25,39 +25,51 @@ def _load_config() -> Any:
     return load_config_readonly()
 
 
-def is_enabled() -> bool:
+def _shadow_config() -> dict[str, Any]:
     try:
         config = _load_config()
         if not isinstance(config, dict):
-            return False
+            return {}
         observability = config.get("observability")
         if not isinstance(observability, dict):
-            return False
+            return {}
         section = observability.get("envelope_shadow")
-        return isinstance(section, dict) and section.get("enabled") is True
+        return section if isinstance(section, dict) else {}
     except Exception:
-        return False
+        return {}
 
 
-def _is_omniroute_endpoint(base_url: Optional[str]) -> bool:
+def is_enabled() -> bool:
+    return _shadow_config().get("enabled") is True
+
+
+def _normalized_config_values(value: Any) -> tuple[str, ...]:
+    if not isinstance(value, list):
+        return ()
+    return tuple(
+        normalized
+        for item in value
+        if isinstance(item, str) and (normalized := item.strip().lower().rstrip("/"))
+    )
+
+
+def _is_configured_endpoint(base_url: Optional[str], section: dict[str, Any]) -> bool:
     normalized = str(base_url or "").strip().lower().rstrip("/")
-    return normalized in {
-        "http://127.0.0.1:20128",
-        "http://127.0.0.1:20128/v1",
-        "http://localhost:20128",
-        "http://localhost:20128/v1",
-    }
+    return bool(normalized) and normalized in _normalized_config_values(
+        section.get("base_urls")
+    )
 
 
-def _is_combo_model(model: Optional[str]) -> bool:
+def _is_combo_model(model: Optional[str], section: dict[str, Any]) -> bool:
     normalized = str(model or "").strip().lower()
-    return normalized.startswith("auto/") or normalized in {
-        "cascade-all",
-        "tier0-local",
-        "tier1-flat",
-        "tier2-free-cloud",
-        "tier3-paid",
-    }
+    if not normalized:
+        return False
+    if normalized in _normalized_config_values(section.get("combo_models")):
+        return True
+    return any(
+        normalized.startswith(prefix)
+        for prefix in _normalized_config_values(section.get("combo_model_prefixes"))
+    )
 
 
 def _request_fingerprint_material(
@@ -86,10 +98,11 @@ def prepare_model_call_shadow(
     task_id: Optional[str],
     api_request_id: Optional[str],
 ) -> tuple[dict[str, Any], Optional[ModelCallShadow]]:
-    """Inject a Phase 1 correlation header only for the local OmniRoute gateway."""
-    if not is_enabled():
+    """Inject correlation only for an explicitly allow-listed router endpoint."""
+    section = _shadow_config()
+    if section.get("enabled") is not True:
         return request, None
-    if not _is_omniroute_endpoint(base_url):
+    if not _is_configured_endpoint(base_url, section):
         return request, None
 
     try:
@@ -104,7 +117,9 @@ def prepare_model_call_shadow(
         envelope = TaskEnvelope(
             **{
                 **envelope.to_dict(),
-                "execution_surface": "combo" if _is_combo_model(model) else "direct_model",
+                "execution_surface": (
+                    "combo" if _is_combo_model(model, section) else "direct_model"
+                ),
                 "lane": "hermes",
             }
         )

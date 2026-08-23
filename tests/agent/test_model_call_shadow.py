@@ -8,6 +8,7 @@ import pytest
 
 from agent import model_call_shadow
 from agent.action_receipts import ActionReceiptLedger
+from hermes_cli.config_defaults import DEFAULT_CONFIG
 from run_agent import AIAgent
 
 
@@ -40,12 +41,72 @@ def test_flag_off_leaves_request_object_untouched_and_does_not_create_db(
     assert not db_path.exists()
 
 
-def _enable_shadow(monkeypatch):
+def _enable_shadow(monkeypatch, **overrides):
+    section = {
+        "enabled": True,
+        "base_urls": [
+            "http://127.0.0.1:20128/v1",
+            "http://localhost:20128/v1",
+        ],
+        "combo_models": [],
+        "combo_model_prefixes": ["auto/"],
+        **overrides,
+    }
     monkeypatch.setattr(
         model_call_shadow,
         "_load_config",
-        lambda: {"observability": {"envelope_shadow": {"enabled": True}}},
+        lambda: {"observability": {"envelope_shadow": section}},
     )
+
+
+def test_observability_defaults_are_registered_and_off():
+    observability = DEFAULT_CONFIG["observability"]
+    assert observability["envelope_shadow"] == {
+        "enabled": False,
+        "base_urls": [],
+        "combo_models": [],
+        "combo_model_prefixes": [],
+    }
+    assert observability["action_receipts"] == {"enabled": False}
+
+
+def test_enabled_without_an_explicit_router_target_is_inert(monkeypatch):
+    _enable_shadow(monkeypatch, base_urls=[])
+    request = {"model": "test", "messages": []}
+
+    prepared, shadow = model_call_shadow.prepare_model_call_shadow(
+        request,
+        base_url="http://127.0.0.1:20128/v1",
+        provider="custom-router",
+        model="test",
+        api_mode="chat_completions",
+        session_id="session-1",
+        task_id="task-1",
+        api_request_id="turn-1:api:inert",
+    )
+
+    assert prepared is request
+    assert shadow is None
+
+
+def test_configured_nonlocal_router_is_portable(monkeypatch):
+    _enable_shadow(monkeypatch, base_urls=["https://router.example/v1"])
+    request = {"model": "test", "messages": []}
+
+    prepared, shadow = model_call_shadow.prepare_model_call_shadow(
+        request,
+        base_url="https://router.example/v1/",
+        provider="custom-router",
+        model="test",
+        api_mode="chat_completions",
+        session_id="session-1",
+        task_id="task-1",
+        api_request_id="turn-1:api:portable",
+    )
+
+    assert prepared is not request
+    assert shadow is not None
+    assert prepared["extra_headers"]["x-request-id"] == shadow.envelope.action_id
 
 
 def test_enabled_omniroute_call_preserves_headers_and_injects_action_id(monkeypatch):

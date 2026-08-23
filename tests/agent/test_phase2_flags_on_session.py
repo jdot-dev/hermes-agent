@@ -10,6 +10,7 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 from agent import phase2_enforcement
+from hermes_cli.config_defaults import DEFAULT_CONFIG
 from run_agent import AIAgent
 
 
@@ -100,6 +101,10 @@ def _call() -> SimpleNamespace:
             name="read_file", arguments=json.dumps({"path": str(Path(__file__).resolve())})
         ),
     )
+
+
+def test_task_envelope_enforcement_default_is_registered_and_off():
+    assert DEFAULT_CONFIG["enforcement"]["task_envelopes"] == {"enabled": False}
 
 
 def _run(agent: AIAgent, messages: list, dispatch: MagicMock) -> None:

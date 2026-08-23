@@ -1558,6 +1558,12 @@ observability:
   action_receipts:
     enabled: false                # append redacted hash-chained action receipts
 
+# Sealed task authority is separately opt-in. Enable only after sealing a
+# representative plan and passing scripts/phase2_enforcement_readiness_gate.py.
+enforcement:
+  task_envelopes:
+    enabled: false
+
 # =============================================================================
 # Subagent Delegation
 # =============================================================================

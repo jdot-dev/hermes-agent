@@ -2080,6 +2080,14 @@ DEFAULT_CONFIG = {
         },
     },
 
+    # Sealed task-envelope enforcement is opt-in. A missing or non-boolean
+    # value preserves the legacy runtime; exact true enables fail-closed checks.
+    "enforcement": {
+        "task_envelopes": {
+            "enabled": False,
+        },
+    },
+
     # Subagent delegation — override the provider:model used by delegate_task
     # so child agents can run on a different (cheaper/faster) provider and model.
     # Uses the same runtime provider resolution as CLI/gateway startup, so all

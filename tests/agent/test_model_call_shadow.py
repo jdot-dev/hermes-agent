@@ -336,7 +336,14 @@ def test_flags_on_bound_direct_model_call_records_exact_sealed_v2(monkeypatch, t
     monkeypatch.setattr(
         model_call_shadow,
         "_load_config",
-        lambda: {"observability": {"envelope_shadow": {"enabled": True}}},
+        lambda: {
+            "observability": {
+                "envelope_shadow": {
+                    "enabled": True,
+                    "base_urls": ["http://127.0.0.1:20128/v1"],
+                }
+            }
+        },
     )
     envelope = _sealed_model_envelope(tmp_path)
     response = SimpleNamespace(

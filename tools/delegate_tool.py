@@ -3971,6 +3971,7 @@ def delegate_task(
             subagent_id=subagent_id,
             message=message,
             parent_agent=parent_agent,
+            credentials_cfg=credentials_cfg,
             _authority_box=authority_box,
         )
     finally:
@@ -3995,6 +3996,7 @@ def _delegate_task_impl(
     subagent_id: Optional[str] = None,
     message: Optional[str] = None,
     parent_agent=None,
+    credentials_cfg: Optional[Dict[str, Any]] = None,
     _authority_box: Optional[Dict[str, Any]] = None,
 ) -> str:
     """Body of :func:`delegate_task`; see there for the caller contract."""

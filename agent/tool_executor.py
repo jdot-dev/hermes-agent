@@ -20,6 +20,7 @@ import os
 import random
 import threading
 import time
+from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any, Optional
 
@@ -371,6 +372,71 @@ def _emit_cancelled_terminal_post_tool_call(
     return result
 
 
+def _maybe_record_action_receipt(
+    agent,
+    *,
+    function_name: str,
+    function_args: Any,
+    result: Any,
+    effective_task_id: str,
+    tool_call_id: str,
+    duration_s: float,
+    exit_status: str,
+) -> None:
+    """Record one shadow action receipt for a tool call that actually ran.
+
+    Default-off observability, gated on ``observability.action_receipts.enabled``.
+    When that setting is absent or false this returns after a single boolean
+    check — no envelope is built and no database is opened or created.
+
+    Every failure here is swallowed. This is telemetry: it must never change
+    what a tool did, what the model sees, or the order it sees it in. Callers
+    are responsible for invoking it only for calls that actually started —
+    malformed, preflight-blocked, and skipped-before-start calls never reach it.
+    """
+    try:
+        from agent.action_receipts import ActionReceiptLedger, is_enabled
+
+        if not is_enabled():
+            return
+
+        from agent.task_envelope import build_shadow_envelope
+
+        try:
+            cwd = getattr(get_active_env(effective_task_id), "cwd", None)
+        except Exception:
+            cwd = None
+
+        session_id = getattr(agent, "session_id", "") or None
+        envelope = build_shadow_envelope(
+            tool_name=function_name,
+            args=function_args,
+            cwd=str(cwd) if cwd else None,
+            session_id=session_id,
+            task_id=effective_task_id or None,
+            tool_call_id=tool_call_id or None,
+        )
+        receipt_cwd = (
+            getattr(envelope, "cwd", None)
+            if not isinstance(envelope, Mapping)
+            else str(cwd) if cwd else None
+        )
+        ActionReceiptLedger().record_receipt(
+            tool_name=function_name,
+            args=function_args,
+            output=result,
+            exit_status=exit_status,
+            duration_ms=int(duration_s * 1000),
+            session_id=session_id,
+            task_id=effective_task_id or None,
+            tool_call_id=tool_call_id or None,
+            cwd=receipt_cwd,
+            envelope=envelope,
+        )
+    except Exception as exc:
+        logger.warning("action receipt write failed for %s: %s", function_name, exc)
+
+
 def _tool_search_scoped_names(agent) -> frozenset:
     """Return the deferrable tool names the session may invoke via tool_call.
 
@@ -592,8 +658,28 @@ def _run_agent_tool_execution_middleware(
     middleware_trace: list[dict[str, Any]] | None = None,
     begin_execution=None,
     authorization_gate: _ConcurrentToolAuthorizationGate | None = None,
+    on_dispatch=None,
+    cancel_receipt=True,
 ) -> _ManagedToolResult:
-    """Run Relay rewrites before Hermes policy and dispatch exactly once."""
+    """Run Relay rewrites before Hermes policy and dispatch exactly once.
+
+    ``on_dispatch`` fires on the worker thread at the single point where the
+    call is past every preflight gate (scope block, ``pre_tool_call`` plugins,
+    guardrails, start-order abandonment) and is about to enter the tool. It is
+    the "actually started" signal the shadow action-receipt ledger keys on:
+    a call that never reaches it produced no side effect and must produce no
+    receipt, while a call that reaches it is owed exactly one receipt even if
+    the worker is later abandoned by a timeout and never returns.
+
+    ``cancel_receipt`` keeps that invariant when a ``KeyboardInterrupt`` unwinds
+    the call instead of returning one: a tool that had already started is owed
+    its receipt here, because no ``_ManagedToolResult`` will ever reach the
+    caller. Callers that do their own claim-guarded bookkeeping across a batch
+    (the concurrent path) pass ``False`` and record it themselves; a callable is
+    called at cancellation time and must return whether this call may claim the
+    slot, which is how the sequential funnel keeps an abandoned worker from
+    writing a second receipt for a call the turn already attested.
+    """
     from agent import relay_tools
     from hermes_cli.middleware import (
         apply_tool_request_middleware,
@@ -713,6 +799,15 @@ def _run_agent_tool_execution_middleware(
 
         _advance_start_order(_begin)
 
+        # Past every preflight gate and past start-order abandonment: the tool
+        # is about to run. Anything that keys on "this call actually started"
+        # (the shadow receipt ledger) latches here, never earlier.
+        if on_dispatch is not None:
+            try:
+                on_dispatch(final_args)
+            except Exception:
+                logger.debug("on_dispatch hook failed", exc_info=True)
+
         # Keep the gateway turn-inactivity watchdog from abandoning a turn
         # whose tool call runs silently for longer than the inactivity
         # timeout (#84491): stamp activity periodically while the tool is
@@ -766,18 +861,44 @@ def _run_agent_tool_execution_middleware(
             api_request_id=getattr(agent, "_current_api_request_id", "") or "",
         )
 
-    result, _relay_args = relay_tools.execute(
-        function_name,
-        function_args,
-        _hermes_pipeline,
-        session_id=str(getattr(agent, "session_id", "") or ""),
-        metadata={
-            "task_id": effective_task_id or "",
-            "turn_id": getattr(agent, "_current_turn_id", "") or "",
-            "api_request_id": getattr(agent, "_current_api_request_id", "") or "",
-            "tool_call_id": tool_call_id or "",
-        },
-    )
+    _started_at = time.time()
+    try:
+        result, _relay_args = relay_tools.execute(
+            function_name,
+            function_args,
+            _hermes_pipeline,
+            session_id=str(getattr(agent, "session_id", "") or ""),
+            metadata={
+                "task_id": effective_task_id or "",
+                "turn_id": getattr(agent, "_current_turn_id", "") or "",
+                "api_request_id": getattr(agent, "_current_api_request_id", "") or "",
+                "tool_call_id": tool_call_id or "",
+            },
+        )
+    except BaseException as exc:
+        # An unwind never produces a _ManagedToolResult, so this is the last
+        # place that still knows whether the tool got as far as running. Failures
+        # landing in the preamble — a scope block, a plugin, or _BatchAbandoned
+        # at the start-order gate — leave ``dispatched`` false and stay
+        # receipt-free; anything past dispatch is owed its one receipt.
+        _may_record = cancel_receipt() if callable(cancel_receipt) else cancel_receipt
+        if _may_record and state["dispatched"]:
+            _cancelled = isinstance(exc, KeyboardInterrupt)
+            _maybe_record_action_receipt(
+                agent,
+                function_name=function_name,
+                function_args=state["args"],
+                result=(
+                    _cancelled_tool_result()
+                    if _cancelled
+                    else f"Error executing tool '{function_name}': {exc}"
+                ),
+                effective_task_id=effective_task_id,
+                tool_call_id=tool_call_id,
+                duration_s=time.time() - _started_at,
+                exit_status="cancelled" if _cancelled else "error",
+            )
+        raise
     return _ManagedToolResult(
         result=result,
         args=state["args"],
@@ -853,6 +974,13 @@ def _run_sequential_tool_execution_middleware(
 
     authorization_gate = _ConcurrentToolAuthorizationGate()
     worker_tid: list[int] = []
+    # One receipt slot for this call, contended between the worker (if
+    # cancellation unwinds it) and the turn (if it abandons the worker and
+    # synthesizes a result). Whoever wins reports; the loser stays silent.
+    _receipt_slot = threading.Lock()
+
+    def _claim_receipt_slot() -> bool:
+        return _receipt_slot.acquire(blocking=False)
 
     def _run() -> _ManagedToolResult:
         tid = threading.current_thread().ident
@@ -861,7 +989,10 @@ def _run_sequential_tool_execution_middleware(
             agent._tool_worker_threads.add(tid)
         try:
             return _run_agent_tool_execution_middleware(
-                agent, authorization_gate=authorization_gate, **kwargs
+                agent,
+                authorization_gate=authorization_gate,
+                cancel_receipt=_claim_receipt_slot,
+                **kwargs,
             )
         finally:
             with agent._tool_worker_threads_lock:
@@ -957,7 +1088,10 @@ def _run_sequential_tool_execution_middleware(
                 args=function_args,
                 middleware_trace=trace,
                 blocked=False,
-                dispatched=True,
+                # False only when the abandoned worker already claimed the
+                # receipt slot on its way out — the call still ran, but the
+                # turn must not attest it twice.
+                dispatched=_claim_receipt_slot(),
             )
 
         # Only reachable when a deadline exists (interrupted returns above).
@@ -994,7 +1128,7 @@ def _run_sequential_tool_execution_middleware(
             args=function_args,
             middleware_trace=trace,
             blocked=False,
-            dispatched=True,
+            dispatched=_claim_receipt_slot(),
         )
     finally:
         # Never join a wedged worker. DaemonThreadPoolExecutor also keeps it out
@@ -1225,6 +1359,36 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
         if block_result is not None:
             results[i] = (name, args, block_result, 0.0, True, True, middleware_trace)
 
+    # ── Shadow action-receipt bookkeeping ────────────────────────────
+    # Two facts the receipt invariant needs, shared across the worker threads
+    # and the post-execution loop on the main thread:
+    #   started_indices  — the call got past every preflight gate and entered
+    #                      the tool, so it is owed exactly one receipt.
+    #   receipt_claimed  — that receipt has been written. A worker abandoned by
+    #                      the batch deadline has its receipt written by the
+    #                      main thread; if the worker then finishes late it
+    #                      finds the slot claimed and cannot append a second.
+    receipt_state_lock = threading.Lock()
+    started_indices: set[int] = set()
+    receipt_claimed: set[int] = set()
+
+    def _mark_started(index: int) -> None:
+        with receipt_state_lock:
+            started_indices.add(index)
+
+    def _claim_receipt(index: int) -> bool:
+        """Reserve the single receipt slot for ``index``.
+
+        False when the call never started (nothing ran, so nothing to attest)
+        or when its receipt was already written — the two halves of "exactly
+        one receipt per actually-started tool call".
+        """
+        with receipt_state_lock:
+            if index not in started_indices or index in receipt_claimed:
+                return False
+            receipt_claimed.add(index)
+            return True
+
     start_condition = threading.Condition()
     next_start_order = 0
     # Set once the batch is abandoned (deadline or interrupt) so a worker parked
@@ -1397,6 +1561,8 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                     middleware_trace=middleware_trace,
                     begin_execution=_advance_start,
                     authorization_gate=authorization_gate,
+                    on_dispatch=lambda _args, _i=index: _mark_started(_i),
+                    cancel_receipt=False,
                 )
                 result = managed.result
                 function_args = managed.args
@@ -1430,6 +1596,17 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                 )
                 duration = time.time() - start
                 logger.info("tool %s cancelled (%.2fs)", function_name, duration)
+                if _claim_receipt(index):
+                    _maybe_record_action_receipt(
+                        agent,
+                        function_name=function_name,
+                        function_args=function_args,
+                        result=result,
+                        effective_task_id=effective_task_id,
+                        tool_call_id=getattr(tool_call, "id", "") or "",
+                        duration_s=duration,
+                        exit_status="cancelled",
+                    )
                 results[index] = (
                     function_name,
                     function_args,
@@ -1460,6 +1637,20 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                 logger.info("tool %s failed (%.2fs): %s", function_name, duration, result[:200])
             else:
                 logger.info("tool %s completed (%.2fs, %d chars)", function_name, duration, len(result))
+            # Receipt for a call that reached dispatch. _claim_receipt is false
+            # for preflight-blocked calls (on_dispatch never fired) and for any
+            # index the abandonment sweep below already attested.
+            if _claim_receipt(index):
+                _maybe_record_action_receipt(
+                    agent,
+                    function_name=function_name,
+                    function_args=function_args,
+                    result=result,
+                    effective_task_id=effective_task_id,
+                    tool_call_id=getattr(tool_call, "id", "") or "",
+                    duration_s=duration,
+                    exit_status="error" if is_error else "ok",
+                )
             results[index] = (
                 function_name,
                 function_args,
@@ -1729,6 +1920,21 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                 middleware_trace=list(middleware_trace),
             )
             tool_duration = float(timeout_s or 0.0)
+            # Durable receipt for a started call the turn abandoned. The worker
+            # is still wedged in dispatch and may never come back, so the turn
+            # attests on its behalf; _claim_receipt keeps it to exactly one if
+            # the worker does surface later.
+            if _claim_receipt(i):
+                _maybe_record_action_receipt(
+                    agent,
+                    function_name=name,
+                    function_args=args,
+                    result=function_result,
+                    effective_task_id=effective_task_id,
+                    tool_call_id=getattr(tc, "id", "") or "",
+                    duration_s=tool_duration,
+                    exit_status="timeout",
+                )
         elif r is None:
             # Tool was cancelled (interrupt) or thread didn't return
             if agent._interrupt_requested:
@@ -1760,6 +1966,19 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                     middleware_trace=list(middleware_trace),
                 )
             tool_duration = 0.0
+            if _claim_receipt(i):
+                _maybe_record_action_receipt(
+                    agent,
+                    function_name=name,
+                    function_args=args,
+                    result=function_result,
+                    effective_task_id=effective_task_id,
+                    tool_call_id=getattr(tc, "id", "") or "",
+                    duration_s=tool_duration,
+                    exit_status=(
+                        "cancelled" if agent._interrupt_requested else "error"
+                    ),
+                )
         else:
             function_name, function_args, function_result, tool_duration, is_error, blocked, middleware_trace = r
             name = function_name
@@ -2667,6 +2886,9 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
         _execution_timed_out = isinstance(
             function_result, (_ToolTimeoutResult, _ToolCancelledResult)
         )
+        # Guardrail observations below are model-facing annotations appended
+        # after the fact; the receipt attests the bytes the tool itself emitted.
+        _receipt_output = function_result
         if isinstance(function_result, str):
             result_preview = function_result if agent.verbose_logging else (
                 function_result[:200] if len(function_result) > 200 else function_result
@@ -2717,6 +2939,31 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
             logger.warning("Tool %s returned error (%.2fs): %s", function_name, tool_duration, result_preview)
         else:
             logger.info("tool %s completed (%.2fs, %d chars)", function_name, tool_duration, _result_len)
+
+        # Shadow receipt for a call that actually ran. Malformed-argument and
+        # interrupt-skipped calls left the loop earlier; blocked calls never
+        # dispatched; cancelled ones were attested as they unwound. A tool the
+        # sequential funnel abandoned on its deadline is still owed a durable
+        # receipt, so the timeout marker records rather than suppresses.
+        if _execution_dispatched and not _execution_blocked:
+            _maybe_record_action_receipt(
+                agent,
+                function_name=function_name,
+                function_args=function_args,
+                result=_receipt_output,
+                effective_task_id=effective_task_id,
+                tool_call_id=getattr(tool_call, "id", "") or "",
+                duration_s=tool_duration,
+                exit_status=(
+                    "timeout"
+                    if isinstance(_receipt_output, _ToolTimeoutResult)
+                    else "cancelled"
+                    if isinstance(_receipt_output, _ToolCancelledResult)
+                    else "error"
+                    if _is_error_result
+                    else "ok"
+                ),
+            )
 
         # Track file-mutation outcome for the turn-end verifier.  See
         # the concurrent path for the rationale; both paths must feed

@@ -3301,31 +3301,49 @@ def run_conversation(
                             is_github_responses=agent._is_copilot_url(),
                             sanitize_harmony_tokens=agent._is_codex_backend(),
                         )
-                    if _use_streaming:
-                        return agent._interruptible_streaming_api_call(
-                            next_api_kwargs, on_first_delta=_stop_spinner
-                        )
-                    from agent import relay_llm
+                    def _dispatch_model_call(prepared_api_kwargs):
+                        def _dispatch():
+                            if _use_streaming:
+                                return agent._interruptible_streaming_api_call(
+                                    prepared_api_kwargs, on_first_delta=_stop_spinner
+                                )
+                            from agent import relay_llm
 
-                    return relay_llm.execute(
+                            return relay_llm.execute(
+                                prepared_api_kwargs,
+                                agent._interruptible_api_call,
+                                session_id=str(agent.session_id or ""),
+                                name=str(agent.provider or "provider"),
+                                model_name=str(agent.model or ""),
+                                metadata={
+                                    "api_mode": agent.api_mode,
+                                    "api_request_id": api_request_id,
+                                    "call_role": (
+                                        "delegated"
+                                        if getattr(agent, "is_subagent", False)
+                                        else "fallback"
+                                        if int(getattr(agent, "_fallback_index", 0) or 0) > 0
+                                        else "primary"
+                                    ),
+                                    "retry_count": retry_count,
+                                },
+                                defer_logical_completion=True,
+                            )
+
+                        return _dispatch()
+
+                    from agent.model_call_shadow import run_model_call_shadow
+
+                    return run_model_call_shadow(
                         next_api_kwargs,
-                        agent._interruptible_api_call,
-                        session_id=str(agent.session_id or ""),
-                        name=str(agent.provider or "provider"),
-                        model_name=str(agent.model or ""),
-                        metadata={
-                            "api_mode": agent.api_mode,
-                            "api_request_id": api_request_id,
-                            "call_role": (
-                                "delegated"
-                                if getattr(agent, "is_subagent", False)
-                                else "fallback"
-                                if int(getattr(agent, "_fallback_index", 0) or 0) > 0
-                                else "primary"
-                            ),
-                            "retry_count": retry_count,
-                        },
-                        defer_logical_completion=True,
+                        _dispatch_model_call,
+                        base_url=agent.base_url,
+                        provider=agent.provider,
+                        model=agent.model,
+                        api_mode=agent.api_mode,
+                        session_id=agent.session_id,
+                        task_id=effective_task_id,
+                        api_request_id=api_request_id,
                     )
 
                 from hermes_cli.middleware import run_llm_execution_middleware

@@ -4202,12 +4202,20 @@ def _delegate_task_impl(
     # Validate every route before resolving any credentials. This keeps a later
     # invalid batch item from triggering provider lookup, credential loading, or
     # any other route-specific side effect for an earlier valid item.
+    # ``credentials_cfg`` (internal callers only — never model-facing) is a
+    # per-call override shaped like the delegation config section
+    # ({provider, model, base_url, api_key, api_mode}); the /review engine
+    # uses it to route its reviewer subagent onto ``auxiliary.review``
+    # without touching the global delegation pin. When supplied, named-route
+    # resolution applies to the override exactly as it applies to ``cfg``
+    # (canonical: stage/delegation-routes-20260821).
+    base_credentials_cfg = credentials_cfg if credentials_cfg else cfg
     effective_routes: List[Optional[str]] = [
         task.get("route") or route for task in task_list
     ]
     try:
         route_cfgs = [
-            _resolve_delegation_route_config(cfg, effective_route)
+            _resolve_delegation_route_config(base_credentials_cfg, effective_route)
             for effective_route in effective_routes
         ]
     except ValueError as exc:
@@ -4215,19 +4223,11 @@ def _delegate_task_impl(
 
     # Resolve each child's provider:model bundle independently only after the
     # whole batch's operator-owned route names have passed validation.
-    # ``credentials_cfg`` (internal callers only — never model-facing) is a
-    # per-call override shaped like the delegation config section
-    # ({provider, model, base_url, api_key, api_mode}); the /review engine
-    # uses it to route its reviewer subagent onto ``auxiliary.review``
-    # without touching the global delegation pin. It wins over route
-    # resolution exactly as it won over ``cfg`` before routes existed.
     task_creds: List[Dict[str, Any]] = []
     try:
         for route_cfg in route_cfgs:
             task_creds.append(
-                _resolve_delegation_credentials(
-                    credentials_cfg if credentials_cfg else route_cfg, parent_agent
-                )
+                _resolve_delegation_credentials(route_cfg, parent_agent)
             )
     except ValueError as exc:
         return tool_error(str(exc))

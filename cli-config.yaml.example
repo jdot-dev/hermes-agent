@@ -1544,6 +1544,21 @@ code_execution:
   # max_session_kernels: 4      # Process-wide LRU cap on live kernels
 
 # =============================================================================
+# Execution Observability (default off)
+# =============================================================================
+# Model-call correlation adds x-request-id only for explicitly allow-listed
+# compatible router endpoints. Enabling the feature with an empty base_urls
+# list is intentionally inert.
+observability:
+  envelope_shadow:
+    enabled: false
+    base_urls: []                 # e.g. ["https://router.example/v1"]
+    combo_models: []              # exact model names treated as routed/composite
+    combo_model_prefixes: []      # e.g. ["auto/"]
+  action_receipts:
+    enabled: false                # append redacted hash-chained action receipts
+
+# =============================================================================
 # Subagent Delegation
 # =============================================================================
 # The delegate_task tool spawns child agents with isolated context.

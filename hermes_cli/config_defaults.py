@@ -2065,6 +2065,21 @@ DEFAULT_CONFIG = {
         "provider": "",
     },
 
+    # Default-off execution observability. Model-call correlation mutates
+    # outbound headers, so enabling the feature is not sufficient by itself:
+    # operators must explicitly allow-list each compatible router endpoint.
+    "observability": {
+        "envelope_shadow": {
+            "enabled": False,
+            "base_urls": [],
+            "combo_models": [],
+            "combo_model_prefixes": [],
+        },
+        "action_receipts": {
+            "enabled": False,
+        },
+    },
+
     # Subagent delegation — override the provider:model used by delegate_task
     # so child agents can run on a different (cheaper/faster) provider and model.
     # Uses the same runtime provider resolution as CLI/gateway startup, so all

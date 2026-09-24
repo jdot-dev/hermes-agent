@@ -587,8 +587,7 @@ def _bare_model(model: Optional[str]) -> str:
 def _is_kimi_model(model: Optional[str]) -> bool:
     """True for any Kimi / Moonshot model that manages temperature server-side."""
     bare = _bare_model(model)
-    return bare.startswith("kimi-") or bare == "kimi"
-
+    return bare.startswith("kimi-") or bare == "kimi" or bare == "k3" or bare.startswith("k3-")
 
 def _is_arcee_trinity_thinking(model: Optional[str]) -> bool:
     """True for Arcee Trinity Large Thinking (direct or via OpenRouter)."""

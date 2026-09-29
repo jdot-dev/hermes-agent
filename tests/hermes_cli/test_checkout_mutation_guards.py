@@ -40,6 +40,13 @@ class TestPredicate:
 
 
 class TestEarlyRecovery:
+    def test_interrupted_pull_skips_live_checkout_before_git_marker_probe(self, monkeypatch):
+        def unexpected_marker_probe(root):
+            raise AssertionError("recovery inspected live Git metadata")
+
+        monkeypatch.setattr(er, "interrupted_pull_marker", unexpected_marker_probe)
+        assert er.restore_interrupted_pull(project_root=CHECKOUT_ROOT) is False
+
     def test_skips_live_checkout_before_any_probe_or_lock(self, monkeypatch):
         # A probe call would mean recovery is proceeding against the live
         # checkout; the guard must return before ANY side-effectful step.

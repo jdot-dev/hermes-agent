@@ -17,7 +17,7 @@ from pm.workspace import enabled_member_dirs, lock_and_sync
 from tests.pm import _fixtures
 
 
-@pytest.mark.parametrize("modern", [False, True])
+@pytest.mark.parametrize("modern", [False, True, "tooling-only"])
 def test_declaration_policy_survives_cross_profile_resolution(tmp_path, monkeypatch, modern):
     home = tmp_path / "custom-home"
     sibling = home / "profiles" / "work"
@@ -52,10 +52,12 @@ def test_declaration_policy_survives_cross_profile_resolution(tmp_path, monkeypa
              'remote @ https://example.invalid/unreviewed.whl',
              'missing-other-python; python_version < "3.0"']
     (plugin / "plugin.yaml").write_text(
-        'name: member\npython_dependencies: ' + json.dumps(["ignored==99"] if modern else specs) + '\n',
+        'name: member\npython_dependencies: ' + json.dumps(["ignored==99"] if modern is True else specs) + '\n',
         encoding="utf-8",
     )
-    if modern:
+    if modern == "tooling-only":
+        (plugin / "pyproject.toml").write_text('[tool.ruff]\nline-length=100\n', encoding="utf-8")
+    if modern is True:
         (plugin / "pyproject.toml").write_text(
             '[project]\nname="member"\nversion="1"\nrequires-python=">=3.11"\n'
             f'dependencies={json.dumps(specs)}\n[tool.uv]\npackage=false\n', encoding="utf-8",
@@ -84,6 +86,14 @@ def test_declaration_policy_survives_cross_profile_resolution(tmp_path, monkeypa
     generated = tomllib.loads((root / relative / "pyproject.toml").read_text())["project"]["dependencies"]
     assert generated == [specs[0], specs[3]], "target markers must reach uv, unsafe/self requirements must not"
     assert all(p.read_bytes() == body for p, body in before.items())
+
+
+def test_tooling_only_plugin_has_no_python_workspace_member(tmp_path):
+    project = tmp_path / "pyproject.toml"
+    project.write_text('[tool.pytest.ini_options]\ntestpaths=["tests"]\n', encoding="utf-8")
+    declaration = read_python_declaration(tmp_path)
+    assert not declaration.is_member
+    assert project in declaration.files, "tooling configuration still contributes to currency"
 
 
 @pytest.mark.parametrize("modern", [False, True])

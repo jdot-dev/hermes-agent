@@ -135,19 +135,34 @@ def _generate_pyproject(plugin_dirs: list[Path] | Mapping[Path, Path], root: Pat
         # uv resolves even unselected extras. Independent plugin development
         # environments may pin different test/lint tools; retain those pins
         # while refusing to activate multiple dev environments together.
+        documents = [document] + [
+            tomllib.loads((root / relative / "pyproject.toml").read_text(encoding="utf-8-sig"))
+            for relative in sorted(members)
+        ]
         development = []
-        if "dev" in document.get("dependency-groups", {}):
-            development.append({"package": document["project"]["name"], "group": "dev"})
-        for relative in sorted(members):
-            member = tomllib.loads((root / relative / "pyproject.toml").read_text(encoding="utf-8-sig"))
+        for member in documents:
             project = member.get("project", {})
-            if "dev" in project.get("optional-dependencies", {}):
-                development.append({"package": project["name"], "extra": "dev"})
-        if len(development) > 1:
+            for name in ("dev", "test"):
+                if name in member.get("dependency-groups", {}):
+                    development.append({"package": project["name"], "group": name})
+                if name in project.get("optional-dependencies", {}):
+                    development.append({"package": project["name"], "extra": name})
+        # A project's own dev and test selections can still be combined.
+        from itertools import combinations
+
+        separate = [list(pair) for pair in combinations(development, 2)
+                    if pair[0]["package"] != pair[1]["package"]]
+        if separate:
             conflicts = policy.setdefault("conflicts", [])
-            selectors = {tuple(sorted(item.items())) for item in development}
-            if not any({tuple(sorted(item.items())) for item in group} == selectors for group in conflicts):
-                conflicts.append(development)
+            known = {frozenset(tuple(sorted(item.items())) for item in group) for group in conflicts}
+            for pair in separate:
+                selectors = frozenset(tuple(sorted(item.items())) for item in pair)
+                if selectors not in known:
+                    conflicts.append(pair)
+                    known.add(selectors)
+            features = policy.get("preview-features", [])
+            if features is not True:
+                policy["preview-features"] = sorted(set(features or []) | {"package-conflicts"})
         text = tomli_w.dumps(document)
     else:
         # Byte-identical to core: a member-less generation syncs frozen against core's own lock.

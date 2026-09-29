@@ -147,7 +147,8 @@ def test_staging_root_and_env_are_honored_without_live_mutation(layout, monkeypa
 
 
 @pytest.mark.parametrize("runtime_conflict", [False, True])
-def test_plugin_development_dependencies_are_separate_environments(tmp_path, runtime_conflict):
+@pytest.mark.parametrize("development_extra", ["dev", "test"])
+def test_plugin_development_dependencies_are_separate_environments(tmp_path, runtime_conflict, development_extra):
     """Real uv resolution keeps plugin dev pins without weakening runtime constraints."""
     import json
     import tomllib
@@ -166,7 +167,7 @@ def test_plugin_development_dependencies_are_separate_environments(tmp_path, run
         '[project]\nname="core"\nversion="1"\nrequires-python=">=3.11"\n'
         'dependencies=["runtimedep==1.0"]\n'
         '[project.optional-dependencies]\none=[]\ntwo=[]\n'
-        '[dependency-groups]\ndev=["devdep==1.0"]\n'
+        '[dependency-groups]\ndev=["devdep==1.0"]\ntest=["devdep==1.0"]\n'
         '[tool.uv]\npackage=false\nno-index=true\ndefault-groups=[]\n'
         'conflicts=[[{package="core",extra="one"},{package="core",extra="two"}]]\n'
         f'find-links=[{json.dumps(wheels.as_posix())}]\n', encoding="utf-8",
@@ -179,7 +180,7 @@ def test_plugin_development_dependencies_are_separate_environments(tmp_path, run
         (plugin / "pyproject.toml").write_text(
             f'[project]\nname="plugin-{index}"\nversion="1"\nrequires-python=">=3.11"\n'
             f'dependencies=["runtimedep=={runtime}"]\n'
-            f'[project.optional-dependencies]\ndev=["devdep=={version}"]\nfeature=[]\n'
+            f'[project.optional-dependencies]\n{development_extra}=["devdep=={version}"]\nfeature=[]\n'
             '[tool.uv]\npackage=false\n', encoding="utf-8",
         )
         plugins.append(plugin)
@@ -211,8 +212,13 @@ def test_plugin_development_dependencies_are_separate_environments(tmp_path, run
             capture_output=True, text=True, timeout=30,
         )
         assert probe.returncode == 0, probe.stderr
+        own_development = environment._run(
+            ["sync", "--frozen", "--all-packages", "--group", "dev", "--group", "test"],
+            cwd=root, timeout=30,
+        )
+        assert own_development.returncode == 0, own_development.stderr
         selected = environment._run(
-            ["sync", "--frozen", "--all-packages", "--group", "dev", "--extra", "dev"],
+            ["sync", "--frozen", "--all-packages", "--group", "dev", "--extra", development_extra],
             cwd=root, timeout=30,
         )
         assert selected.returncode != 0

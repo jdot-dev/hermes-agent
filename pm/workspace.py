@@ -130,7 +130,24 @@ def _generate_pyproject(plugin_dirs: list[Path] | Mapping[Path, Path], root: Pat
 
         document = tomllib.loads(core_text)
         _core_release_quarantine(document, source / "uv.lock")
-        document.setdefault("tool", {}).setdefault("uv", {})["workspace"] = {"members": sorted(members)}
+        policy = document.setdefault("tool", {}).setdefault("uv", {})
+        policy["workspace"] = {"members": sorted(members)}
+        # uv resolves even unselected extras. Independent plugin development
+        # environments may pin different test/lint tools; retain those pins
+        # while refusing to activate multiple dev environments together.
+        development = []
+        if "dev" in document.get("dependency-groups", {}):
+            development.append({"package": document["project"]["name"], "group": "dev"})
+        for relative in sorted(members):
+            member = tomllib.loads((root / relative / "pyproject.toml").read_text(encoding="utf-8-sig"))
+            project = member.get("project", {})
+            if "dev" in project.get("optional-dependencies", {}):
+                development.append({"package": project["name"], "extra": "dev"})
+        if len(development) > 1:
+            conflicts = policy.setdefault("conflicts", [])
+            selectors = {tuple(sorted(item.items())) for item in development}
+            if not any({tuple(sorted(item.items())) for item in group} == selectors for group in conflicts):
+                conflicts.append(development)
         text = tomli_w.dumps(document)
     else:
         # Byte-identical to core: a member-less generation syncs frozen against core's own lock.

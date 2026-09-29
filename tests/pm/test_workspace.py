@@ -144,3 +144,77 @@ def test_staging_root_and_env_are_honored_without_live_mutation(layout, monkeypa
         assert kwargs["env"]["UV_PROJECT_ENVIRONMENT"] == str(environment.destination)
         assert kwargs["env"]["UV_PYTHON"] == str(environment.python)
     assert os.environ["PM_WORKSPACE_TEST_SENTINEL"] == "live"
+
+
+@pytest.mark.parametrize("runtime_conflict", [False, True])
+def test_plugin_development_dependencies_are_separate_environments(tmp_path, runtime_conflict):
+    """Real uv resolution keeps plugin dev pins without weakening runtime constraints."""
+    import json
+    import tomllib
+
+    from pm.environment import PythonEnvironment
+    from tests.pm import _fixtures
+
+    wheels = tmp_path / "wheels"
+    wheels.mkdir()
+    for version in ("1.0", "2.0", "3.0"):
+        _fixtures._wheel(wheels, "devdep", version)
+        _fixtures._wheel(wheels, "runtimedep", version)
+    core = tmp_path / "core"
+    core.mkdir()
+    (core / "pyproject.toml").write_text(
+        '[project]\nname="core"\nversion="1"\nrequires-python=">=3.11"\n'
+        'dependencies=["runtimedep==1.0"]\n'
+        '[project.optional-dependencies]\none=[]\ntwo=[]\n'
+        '[dependency-groups]\ndev=["devdep==1.0"]\n'
+        '[tool.uv]\npackage=false\nno-index=true\ndefault-groups=[]\n'
+        'conflicts=[[{package="core",extra="one"},{package="core",extra="two"}]]\n'
+        f'find-links=[{json.dumps(wheels.as_posix())}]\n', encoding="utf-8",
+    )
+    plugins = []
+    for index, version in enumerate(("2.0", "3.0")):
+        plugin = tmp_path / f"plugin-{index}"
+        plugin.mkdir()
+        runtime = "2.0" if runtime_conflict else "1.0"
+        (plugin / "pyproject.toml").write_text(
+            f'[project]\nname="plugin-{index}"\nversion="1"\nrequires-python=">=3.11"\n'
+            f'dependencies=["runtimedep=={runtime}"]\n'
+            f'[project.optional-dependencies]\ndev=["devdep=={version}"]\nfeature=[]\n'
+            '[tool.uv]\npackage=false\n', encoding="utf-8",
+        )
+        plugins.append(plugin)
+    before = {p / "pyproject.toml": (p / "pyproject.toml").read_bytes() for p in [core, *plugins]}
+    uv = shutil.which("uv")
+    assert uv is not None, "real resolver is required"
+    environment = PythonEnvironment(
+        uv=Path(uv), python=Path(sys.executable), destination=tmp_path / "env",
+        cache=tmp_path / "cache", env=dict(os.environ), offline=True,
+    )
+    root = tmp_path / "snapshot"
+    if runtime_conflict:
+        with pytest.raises(ws.ResolutionConflict):
+            ws.lock_and_sync(plugins, [], root=root, source=core, seed_lock=None, environment=environment)
+    else:
+        ws.lock_and_sync(plugins, [], root=root, source=core, seed_lock=None, environment=environment)
+        document = tomllib.loads((root / "pyproject.toml").read_text())
+        assert document["tool"]["uv"]["conflicts"][0] == [
+            {"package": "core", "extra": "one"}, {"package": "core", "extra": "two"},
+        ]
+        for relative, original in zip(document["tool"]["uv"]["workspace"]["members"], plugins):
+            generated = tomllib.loads((root / relative / "pyproject.toml").read_text())
+            original_doc = tomllib.loads((original / "pyproject.toml").read_text())
+            assert generated["project"]["optional-dependencies"] == original_doc["project"]["optional-dependencies"]
+        probe = subprocess.run(
+            [str(environment.executable), "-I", "-c",
+             "import runtimedep; import importlib.util; "
+             "assert runtimedep.__version__ == '1.0'; assert importlib.util.find_spec('devdep') is None"],
+            capture_output=True, text=True, timeout=30,
+        )
+        assert probe.returncode == 0, probe.stderr
+        selected = environment._run(
+            ["sync", "--frozen", "--all-packages", "--group", "dev", "--extra", "dev"],
+            cwd=root, timeout=30,
+        )
+        assert selected.returncode != 0
+        assert "conflict" in selected.stderr.lower(), selected.stderr
+    assert all(p.read_bytes() == body for p, body in before.items())

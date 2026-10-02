@@ -37,7 +37,7 @@ def _parent() -> SimpleNamespace:
     )
 
 
-def _child_runtime(parent: SimpleNamespace, *, override_base_url=None):
+def _child_runtime(parent: SimpleNamespace, *, override_base_url=None, override_api_key=None):
     return _resolve_child_runtime(
         parent,
         {},
@@ -45,7 +45,7 @@ def _child_runtime(parent: SimpleNamespace, *, override_base_url=None):
         model=None,
         override_provider=None,
         override_base_url=override_base_url,
-        override_api_key=None,
+        override_api_key=override_api_key,
         override_api_mode=None,
         override_acp_command=None,
         override_acp_args=None,
@@ -101,7 +101,9 @@ providers:
 
 def test_endpoint_override_does_not_borrow_parent_named_identity():
     runtime = _child_runtime(
-        _parent(), override_base_url="https://different.invalid/v1"
+        _parent(),
+        override_base_url="https://different.invalid/v1",
+        override_api_key="different-endpoint-key",
     )
 
     assert runtime["provider"] == "custom"

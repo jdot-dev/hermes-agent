@@ -599,6 +599,10 @@ def discover_mcp_tools(allowed_mcp_names: Optional[List[str]] = None) -> List[st
         if not servers:
             logger.debug("No MCP servers in --toolsets filter; skipping MCP load entirely")
             return []
+    else:
+        servers = _config.automatic_mcp_servers(servers)
+        if not servers:
+            return []
     # SDK import deferred to here so a config without servers — or a -t filter that keeps
     # none — never pays it.
     if not _core._ensure_mcp_sdk():
@@ -643,6 +647,8 @@ def reconcile_mcp_servers_with_config() -> Dict[str, List[str]]:
     with _owner_secret_scope():
         servers = _config._load_mcp_config()
     wanted = {name for name, cfg in servers.items() if mcp_server_enabled(cfg)}
+    automatic_wanted = {name for name, cfg in _config.automatic_mcp_servers(servers).items()
+                        if mcp_server_enabled(cfg)}
     scope = _core._mcp_registry_scope()
     with _core._lock:
         owned = [key for key, owner in _core._server_scope_keys.items() if owner == scope]
@@ -656,7 +662,7 @@ def reconcile_mcp_servers_with_config() -> Dict[str, List[str]]:
         _lifecycle.shutdown_mcp_servers(scope=scope, names=set(stale))
     for key in lazy:
         _forget_lazy_server(key)
-    added = _awaiting_connect(wanted, scope)
+    added = _awaiting_connect(automatic_wanted, scope)
     if added:
         discover_mcp_tools()
     return {"removed": stale + sorted(_key_name(k) for k in lazy), "added": added,

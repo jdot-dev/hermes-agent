@@ -438,6 +438,20 @@ def _portable_mcp_servers(safe_servers: Dict[str, dict]) -> None:
         logger.debug("Failed to load portable MCP servers", exc_info=True)
 
 
+def automatic_mcp_servers(servers: Dict[str, dict]) -> Dict[str, dict]:
+    """Profile-local automatic working set, not an authorization or explicit-call filter."""
+    from hermes_cli.config import load_config_readonly
+
+    names = (load_config_readonly().get("mcp") or {}).get("automatic_servers")
+    if names is None:
+        return servers
+    if not isinstance(names, list) or any(not isinstance(name, str) for name in names):
+        logger.warning("mcp.automatic_servers must be a list of server names; automatic discovery paused")
+        return {}
+    selected = {name.strip() for name in names}
+    return {name: config for name, config in servers.items() if name in selected}
+
+
 def _load_mcp_config() -> Dict[str, dict]:
     """``mcp_servers`` from config.yaml as ``{name: config}`` (empty on error / safe mode), ``${VAR}`` interpolated."""
     try:

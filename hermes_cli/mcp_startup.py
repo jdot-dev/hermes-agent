@@ -19,7 +19,7 @@ _mcp_discovery_started: Set[str] = set()
 _mcp_discovery_thread: Dict[str, threading.Thread] = {}
 _mcp_discovery_deferred: Optional[threading.Timer] = None
 # Process-wide MCP server-name allowlist derived from ``-t/--toolsets``.
-# ``None`` = no filter (spawn every configured server). Set once at CLI
+# ``None`` = the configured automatic working set. Set once at CLI
 # startup by ``set_mcp_server_filter`` and honored by every discovery path
 # in this module (inline, background, deferred), so a ``-t terminal``
 # oneshot never cold-starts MCP subprocesses it cannot use.
@@ -84,10 +84,13 @@ def _any_mcp_connected() -> bool:
 
 
 def _servers_awaiting_connect() -> list[str]:
+    from tools.mcp_tool_config import automatic_mcp_servers
     from tools.mcp_tool_discovery import mcp_servers_awaiting_connect
 
     pending = mcp_servers_awaiting_connect()
-    return pending if _mcp_server_filter is None else [n for n in pending if n in _mcp_server_filter]
+    if _mcp_server_filter is None:
+        return list(automatic_mcp_servers(dict.fromkeys(pending, {})))
+    return [n for n in pending if n in _mcp_server_filter]
 
 
 def start_background_mcp_discovery(*, logger, thread_name: str) -> None:

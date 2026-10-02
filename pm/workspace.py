@@ -160,9 +160,6 @@ def _generate_pyproject(plugin_dirs: list[Path] | Mapping[Path, Path], root: Pat
                 if selectors not in known:
                     conflicts.append(pair)
                     known.add(selectors)
-            features = policy.get("preview-features", [])
-            if features is not True:
-                policy["preview-features"] = sorted(set(features or []) | {"package-conflicts"})
         text = tomli_w.dumps(document)
     else:
         # Byte-identical to core: a member-less generation syncs frozen against core's own lock.

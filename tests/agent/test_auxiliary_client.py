@@ -2400,7 +2400,8 @@ class TestKimiTemperatureOmitted:
 
 
     @pytest.mark.asyncio
-    async def test_async_call_omits_temperature(self):
+    @pytest.mark.parametrize("model", ["kimi-for-coding", "kmc/k3", "kmc/k3-256k"])
+    async def test_async_call_omits_temperature(self, model):
         client = MagicMock()
         client.base_url = "https://api.kimi.com/coding/v1"
         response = MagicMock()
@@ -2408,10 +2409,10 @@ class TestKimiTemperatureOmitted:
 
         with patch(
             "agent.auxiliary_client._get_cached_client",
-            return_value=(client, "kimi-for-coding"),
+            return_value=(client, model),
         ), patch(
             "agent.auxiliary_client._resolve_task_provider_model",
-            return_value=("auto", "kimi-for-coding", None, None, None),
+            return_value=("auto", model, None, None, None),
         ):
             result = await async_call_llm(
                 task="session_search",
@@ -2421,7 +2422,7 @@ class TestKimiTemperatureOmitted:
 
         assert result is response
         kwargs = client.chat.completions.create.call_args.kwargs
-        assert kwargs["model"] == "kimi-for-coding"
+        assert kwargs["model"] == model
         assert "temperature" not in kwargs
 
     @pytest.mark.parametrize(

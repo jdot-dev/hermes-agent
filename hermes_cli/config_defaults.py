@@ -540,6 +540,9 @@ DEFAULT_CONFIG = {
     # still only wait their real handshake time.
     "mcp_single_query_discovery_timeout": 15.0,
     "mcp": {  # MCP runtime behavior (distinct from mcp_servers: definitions and auxiliary.mcp).
+        # None preserves discovery of every enabled server. A list bounds automatic startup/retry
+        # only; explicit -t server selection and mcp test/login retain their native routes.
+        "automatic_servers": None,
         # Auto-reload MCP connections when config.yaml's mcp_servers changes (CLI watcher). Every
         # reload rebuilds the tool surface and INVALIDATES the provider prompt cache (next message
         # re-sends the full prefix) — costly on long-context models. When false the watcher still

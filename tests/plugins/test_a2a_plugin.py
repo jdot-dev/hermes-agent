@@ -476,7 +476,8 @@ class TestPersistence:
 
 class TestClientTools:
 
-    def test_peer_metadata_follows_profile_over_real_http(self, tmp_path, monkeypatch):
+    @pytest.mark.parametrize("tool_name", ["a2a_call", "a2a_orchestrate"])
+    def test_peer_metadata_follows_profile_over_real_http(self, tmp_path, monkeypatch, tool_name):
         from pathlib import Path
         from hermes_constants import set_hermes_home_override, reset_hermes_home_override
 
@@ -484,7 +485,7 @@ class TestClientTools:
         captured = []
 
         class Peer(BaseHTTPRequestHandler):
-            def log_message(self, *_):
+            def log_message(self, format: str, *args) -> None:
                 pass
 
             def do_GET(self):
@@ -513,7 +514,10 @@ class TestClientTools:
         try:
             for home in homes:
                 home.mkdir()
-                peer = {"url": f"http://127.0.0.1:{server.server_port}"}
+                peer: dict[str, object] = {
+                    "url": f"http://127.0.0.1:{server.server_port}",
+                    "capabilities": ["stack-canary"],
+                }
                 if home == homes[0]:
                     peer["metadata"] = metadata
                 raw = json.dumps({"a2a_agents": {"peer": peer}})
@@ -522,7 +526,10 @@ class TestClientTools:
             for home in (homes[0], homes[1], homes[0]):
                 token = set_hermes_home_override(str(home))
                 try:
-                    assert "peer reply" in tools.a2a_call({"agent": "peer", "message": "hello"})
+                    result = getattr(tools, tool_name)({
+                        "agent": "peer", "capability": "stack-canary", "message": "hello",
+                    })
+                    assert "peer reply" in result
                 finally:
                     reset_hermes_home_override(token)
             assert [params.get("metadata") for params in captured] == [metadata, None, metadata]

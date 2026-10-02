@@ -957,6 +957,7 @@ def test_real_binding_aggregates_tool_and_approval_timeouts(
     )
     lifecycle.finalize_session(session_id=base["session_id"])
 
+    _join_export_workers()
     root = tmp_path / "hermes-home" / "telemetry" / "shared_metrics"
     snapshot = SharedMetricsStore(
         root / "metrics.sqlite3",

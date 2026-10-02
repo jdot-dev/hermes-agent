@@ -34,7 +34,8 @@ def _configured_peers() -> dict:
 
 def _peer_from_entry(entry: dict, **extra: Any) -> dict:
     return {"url": entry.get("url", ""), "auth": entry.get("auth", {}) or {},
-            "timeout": int(entry.get("timeout", _DEFAULT_TIMEOUT)), **extra}
+            "timeout": int(entry.get("timeout", _DEFAULT_TIMEOUT)),
+            "metadata": entry.get("metadata"), **extra}
 
 
 def _resolve_peer(agent: str) -> Optional[dict]:
@@ -107,6 +108,9 @@ def _send_task(agent_label: str, peer: dict, message: str, context_id: str) -> t
     # v1.0: contextId lives inside the Message, not at the params top level.
     rpc_body = {"jsonrpc": "2.0", "id": protocol.new_task_id(), "method": "SendMessage",
                 "params": {"message": protocol.text_message(protocol.ROLE_USER, safe_message, context_id=ctx)}}
+    metadata = peer.get("metadata")
+    if isinstance(metadata, dict) and metadata:
+        rpc_body["params"]["metadata"] = dict(metadata)
     iface = _select_jsonrpc_interface(card)
     tenant = str(iface["tenant"]) if iface and iface.get("tenant") else str(peer.get("tenant") or "")
     if tenant:

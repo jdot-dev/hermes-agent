@@ -29,6 +29,13 @@ a2a_agents:
     capabilities: [web_search, research]
 ```
 
+An optional peer `metadata` object is copied into each outbound `SendMessage`
+request's `params.metadata`, including calls made by `a2a_orchestrate`. For a
+router that accepts a model selector, set `metadata: {model: "your-route"}` on
+that peer. These are peer-specific extension fields; they do not override the
+message, tenant, endpoint, or authentication. Absent, empty, and non-object
+values are omitted. Direct URL calls do not inherit configured peer metadata.
+
 ## Outbound — call other agents
 
 The agent gets five tools:

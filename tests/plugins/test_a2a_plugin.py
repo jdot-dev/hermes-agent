@@ -476,6 +476,82 @@ class TestPersistence:
 
 class TestClientTools:
 
+    def test_peer_metadata_follows_profile_over_real_http(self, tmp_path, monkeypatch):
+        from pathlib import Path
+        from hermes_constants import set_hermes_home_override, reset_hermes_home_override
+
+        monkeypatch.setattr(Path, "home", lambda: tmp_path)
+        captured = []
+
+        class Peer(BaseHTTPRequestHandler):
+            def log_message(self, *_):
+                pass
+
+            def do_GET(self):
+                self.send_error(404)
+
+            def do_POST(self):
+                body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+                captured.append(body["params"])
+                reply = protocol.jsonrpc_result(body["id"], {"task": protocol.build_task(
+                    "metadata-task", body["params"]["message"]["contextId"],
+                    protocol.STATE_COMPLETED, "peer reply",
+                )})
+                raw = json.dumps(reply).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(raw)))
+                self.end_headers()
+                self.wfile.write(raw)
+
+        server = HTTPServer(("127.0.0.1", 0), Peer)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        homes = [tmp_path / name for name in ("profile-a", "profile-b")]
+        metadata = {"model": "configured-route", "policy": {"label": "bounded"}}
+        original = []
+        try:
+            for home in homes:
+                home.mkdir()
+                peer = {"url": f"http://127.0.0.1:{server.server_port}"}
+                if home == homes[0]:
+                    peer["metadata"] = metadata
+                raw = json.dumps({"a2a_agents": {"peer": peer}})
+                (home / "config.yaml").write_text(raw)
+                original.append(raw)
+            for home in (homes[0], homes[1], homes[0]):
+                token = set_hermes_home_override(str(home))
+                try:
+                    assert "peer reply" in tools.a2a_call({"agent": "peer", "message": "hello"})
+                finally:
+                    reset_hermes_home_override(token)
+            assert [params.get("metadata") for params in captured] == [metadata, None, metadata]
+            assert "metadata" not in captured[1]
+            assert [(home / "config.yaml").read_text() for home in homes] == original
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=2)
+
+    def test_non_object_and_direct_url_metadata_are_not_forwarded(self, monkeypatch):
+        monkeypatch.setattr(tools, "_load_config", lambda: {"a2a_agents": {
+            "peer": {"url": "http://127.0.0.1:1", "metadata": ["invalid"]},
+        }})
+        captured = []
+        monkeypatch.setattr(tools, "_http_get_json", lambda *args: None)
+
+        def post(url, body, headers, timeout):
+            captured.append(body["params"])
+            return protocol.jsonrpc_result(body["id"], {"task": protocol.build_task(
+                "metadata-task", "context", protocol.STATE_COMPLETED, "peer reply",
+            )})
+
+        monkeypatch.setattr(tools, "_http_post_json", post)
+        for agent in ("peer", "http://127.0.0.1:1"):
+            result = tools.a2a_call({"agent": agent, "message": "hello", "metadata": {"model": "ignored"}})
+            assert "peer reply" in result
+        assert all("metadata" not in params for params in captured)
+
 
 
     def test_discover_summarizes_v1_card(self, monkeypatch):

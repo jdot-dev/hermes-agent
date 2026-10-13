@@ -326,7 +326,7 @@ class TestAgentCardV1:
             "web": ["web_search", "web_extract"],
             "terminal": ["terminal"],
         })
-        web = [s for s in skills if s["name"] == "web"][0]
+        web = next(s for s in skills if s["name"] == "web")
         assert "web_search" in web["tags"]
         assert "web_extract" in web["tags"]
 
@@ -639,7 +639,7 @@ class TestRegistryDispatchConvention:
 
     def test_register_then_dispatch_via_registry(self, monkeypatch, tmp_path):
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))
-        monkeypatch.setattr(tools, "_load_config", lambda: {})
+        monkeypatch.setattr(tools, "_load_config", dict)
         from tools.registry import registry
 
         class _Ctx:
@@ -752,7 +752,7 @@ class TestReplyCapture:
 
         try:
             asyncio.run(run())
-            state, text = fut.result(timeout=0)
+            state, _text = fut.result(timeout=0)
             assert state == protocol.STATE_FAILED
         finally:
             adapter._pop_pending("task-fail")
@@ -1338,7 +1338,7 @@ class TestPushNotificationEndToEnd:
         received_evt = threading.Event()
 
         class _Hook(BaseHTTPRequestHandler):
-            def log_message(self, *a):  # noqa: A002
+            def log_message(self, *a):
                 pass
 
             def do_POST(self):

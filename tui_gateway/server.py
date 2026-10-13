@@ -6,7 +6,7 @@ import contextvars
 import copy
 import hashlib
 import importlib
-import inspect  # noqa: F401  (split modules)
+import inspect
 import json
 import logging
 import os
@@ -17,13 +17,13 @@ import sys
 import threading
 import time
 import uuid
-from datetime import datetime, timezone  # noqa: F401  (timezone: split modules)
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable, NamedTuple, Optional  # noqa: F401  (Callable: split modules)
+from typing import Any, Callable, NamedTuple, Optional
 
 # Several of these look unused here but are resolved BARE by split-module bodies rebound onto this
 # namespace (method_ctx.bind_module) — deleting one breaks a handler at call time, not import time.
-from agent.secret_scope import build_profile_secret_scope, reset_secret_scope, set_secret_scope  # noqa: F401
+from agent.secret_scope import build_profile_secret_scope, reset_secret_scope, set_secret_scope
 from hermes_constants import (
     get_hermes_home, get_hermes_home_override, get_process_hermes_home, profile_name_for_home,
     reset_hermes_home_override, set_hermes_home_override)
@@ -35,17 +35,17 @@ from agent.fast_mode import STATIC_TIERS
 from agent.replay_cleanup import canonicalize_replay_history
 from agent.reasoning_effort import clamp_effort, route_supported_efforts
 from agent.voice_turn_route import session_runtime_view
-from agent.compaction_display import project_compaction_message_for_display  # noqa: F401
-from agent.skill_commands import describe_skill_invocation  # noqa: F401
-from agent.conversation_loop import INTERRUPT_WAITING_FOR_MODEL_PREFIX  # noqa: F401
+from agent.compaction_display import project_compaction_message_for_display
+from agent.skill_commands import describe_skill_invocation
+from agent.conversation_loop import INTERRUPT_WAITING_FOR_MODEL_PREFIX
 from tui_gateway import git_probe
 from tui_gateway.checkpoints import (_load_checkpoints_enabled, _resolve_checkpoint_hash,
-                                     resolve_checkpoints_enabled as _resolve_checkpoints_enabled)  # noqa: F401
+                                     resolve_checkpoints_enabled as _resolve_checkpoints_enabled)
 from tui_gateway._env import env_float, env_int
-from tui_gateway.turn_marker import clear_turn_marker, marker_writer_state, read_turn_marker, record_turn_start  # noqa: F401
+from tui_gateway.turn_marker import clear_turn_marker, marker_writer_state, read_turn_marker, record_turn_start
 from tui_gateway.contracts import registry as _contracts
 # User-facing copy shared with the split method modules (they close over this namespace).
-from tui_gateway.user_messages import (  # noqa: F401
+from tui_gateway.user_messages import (
     AGENT_BUILD_ABANDONED, AGENT_MISSING_FOR_TURN, AGENT_STILL_STARTING, agent_init_failed_message, busy_message,
     resume_failed_message, turn_error_text)
 from tui_gateway.transport import (FanoutTransport, StdioTransport, Transport, bind_transport,
@@ -91,7 +91,7 @@ with contextlib.suppress(Exception):
 
     prefetch_update_check()
 
-from tui_gateway.render import make_stream_renderer, render_diff, render_message  # noqa: F401
+from tui_gateway.render import make_stream_renderer, render_diff, render_message
 
 _sessions: dict[str, dict] = {}
 _methods: dict[str, callable] = {}
@@ -184,7 +184,8 @@ _LONG_HANDLERS = frozenset({
     "subscription.resume", "subscription.upgrade", "usage.bars", "session.usage", "billing.step_up",
     "browser.manage", "cli.exec", "complete.path", "complete.slash", "llm.oneshot", "model.options",
     "pet.cells", "pet.gallery", "pet.generate", "pet.hatch", "pet.info", "pet.select", "pet.thumb",
-    "learning.frames", "plugins.manage", "reload.mcp", "mcp.servers.test", "mcp.servers.oauth.start",
+    "learning.frames", "plugins.manage", "plugins.catalog.lookup", "reload.mcp", "mcp.servers.test",
+    "mcp.servers.oauth.start",
     "process.list", "profiles.configure", "profiles.create", "profiles.describe", "profiles.get_asset",
     "profiles.list", "profiles.set_asset", "bot_relay.roster.sync", "bot_relay.outbox.drain",
     "bot_relay.deliver", "bot_relay.reply", "image.generate", "projects.discover_repos",
@@ -711,7 +712,7 @@ def _emit(event: str, sid: str, payload: dict | None = None) -> bool:
     return write_json(_event_frame(event, sid, payload))
 
 
-from tui_gateway import server_requests as _server_requests  # noqa: E402
+from tui_gateway import server_requests as _server_requests
 
 _server_requests.bind_sinks(lambda frame: write_json(frame), lambda event, sid, payload: _emit(event, sid, payload),
                             lambda sid: _session_client_answers_requests(sid),
@@ -1002,7 +1003,7 @@ def _wait_agent_for_prompt(session: dict, rid: str, sid: str) -> dict | None:
     return _err(rid, 5032, err) if (err := session.get("agent_error")) else None
 
 
-def _bind_build_profile_scopes(profile_home: "str | None") -> "_TurnScopes | None":
+def _bind_build_profile_scopes(profile_home: str | None) -> "_TurnScopes | None":
     """Bind a session profile's HERMES_HOME / secret / terminal scopes for an agent build. ``None`` is the
     launch profile: its own launch-env secret scope (live env while single-profile, frozen once
     multiplexing is active — a hosted-room turn for a default member otherwise died at build with
@@ -2754,10 +2755,11 @@ def _hydrate_session_cwd(sid: str, key: str, session_db, profile_home: str | Non
                         _persist_session_cwd_and_schedule_git_meta(_sessions[sid], row["cwd"], db=db)
                     except Exception:
                         logger.debug("failed to enrich resumed session git metadata", exc_info=True)
-            elif not (row and row.get("cwd")) and hasattr(db, "update_session_cwd") and not _is_remote_launch_cwd(
-                _sessions.get(sid)
-            ):
-                # A stored cwd that was set aside (Hermes's own host tree) stays as stored: only an empty row is filled.
+            elif (not (row and row.get("cwd")) or _is_other_profiles_cwd(row["cwd"], profile_home)) and hasattr(
+                db, "update_session_cwd"
+            ) and not _is_remote_launch_cwd(_sessions.get(sid)):
+                # A stored cwd that was set aside (Hermes's own host tree) stays as stored: only an empty row is filled,
+                # or a named profile's row holding another profile's dir (#87584), repaired to this session's own.
                 try:
                     _persist_session_cwd_and_schedule_git_meta(_sessions[sid], _sessions[sid]["cwd"], db=db)
                 except Exception:
@@ -3282,7 +3284,7 @@ def _pet_sprite_payload(pet, *, scale: float) -> dict:
     try:
         stat = pet.spritesheet.stat()
         cache_key = (str(pet.spritesheet), stat.st_mtime_ns, stat.st_size, pet.slug, pet.display_name, round(scale, 4))
-    except Exception:  # noqa: BLE001
+    except Exception:
         cache_key = None
     if cache_key is not None:
         with _pet_payload_cache_lock:
@@ -3292,7 +3294,7 @@ def _pet_sprite_payload(pet, *, scale: float) -> dict:
     try:  # real (padding-trimmed) frame count per state; {} → the canvas uses the static framesPerState
         from agent.pet import render
         frames_by_state = render.state_frame_counts(str(pet.spritesheet))
-    except Exception:  # noqa: BLE001
+    except Exception:
         frames_by_state = {}
     raw = pet.spritesheet.read_bytes()
     mime = "image/png" if pet.spritesheet.suffix.lower() == ".png" else "image/webp"
@@ -3347,7 +3349,7 @@ def _pet_gen_sweep(root, *, max_age_s: float = 3600.0) -> None:
         now = time.time()
         for child in (c for c in root.iterdir() if c.is_dir() and now - c.stat().st_mtime > max_age_s):
             shutil.rmtree(child, ignore_errors=True)
-    except Exception as exc:  # noqa: BLE001 - cleanup is best-effort
+    except Exception as exc:
         logger.debug("pet-gen sweep failed: %s", exc)
 
 
@@ -3647,12 +3649,12 @@ _paste_counter = 0
 
 
 # mcp.servers.* handlers (methods_tools) resolve this BARE through this namespace.
-from .mcp_rpc_helpers import summarize_server as _mcp_summarize_server  # noqa: E402, F401
+from .mcp_rpc_helpers import summarize_server as _mcp_summarize_server
 
 
 # ── Split @method handler modules (see method_ctx.py): imported last so every global the handlers close
 # over exists; register() rebinds them onto this namespace.
-from . import (  # noqa: E402
+from . import (
     methods_voice as _methods_voice, methods_browser as _methods_browser, methods_slash as _methods_slash,
     methods_complete_helpers as _methods_complete_helpers, session_auto_continue as _session_auto_continue,
     plugin_inject as _plugin_inject,
@@ -3675,7 +3677,8 @@ from . import (  # noqa: E402
     methods_connectors as _methods_connectors, methods_connectors_account as _methods_connectors_account,
     methods_display as _methods_display, methods_display_watch as _methods_display_watch,
     methods_onboarding as _methods_onboarding, methods_i18n as _methods_i18n,
-    methods_shared_metrics as _methods_shared_metrics, methods_start_chat as _methods_start_chat)
+    methods_shared_metrics as _methods_shared_metrics, methods_start_chat as _methods_start_chat,
+    methods_plugin_catalog as _methods_plugin_catalog)
 
 for _m in (
     _session_transports, _session_reaper, _session_lifecycle, _session_workdir, _compute_host_bridge, _model_switch,
@@ -3687,6 +3690,6 @@ for _m in (
     _methods_bot_relay, _prompt_turn, _billing_view, _methods_projects, _methods_session_foreign,
     _methods_session_control, _methods_subagents, _methods_vault, _methods_free_tier, _methods_connectors,
     _methods_connectors_account, _methods_display, _methods_display_watch, _methods_onboarding,
-    _methods_i18n, _methods_shared_metrics, _methods_start_chat):
+    _methods_i18n, _methods_shared_metrics, _methods_start_chat, _methods_plugin_catalog):
     _m.register(sys.modules[__name__])
 del _m

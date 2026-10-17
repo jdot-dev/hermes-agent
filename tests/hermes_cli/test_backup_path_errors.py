@@ -57,7 +57,8 @@ def test_import_restores_action_receipts_db_with_0600(tmp_path, monkeypatch):
     # Stub out gateway service helpers so the post-import step does not touch
     # the host's systemd/launchd (mirrors the autouse fixture in test_backup.py).
     import hermes_cli.gateway as gateway_mod
-    monkeypatch.setattr(gateway_mod, "ensure_gateway_service", lambda **kw: False)
+    from hermes_cli import gateway_setup_service
+    monkeypatch.setattr(gateway_setup_service, "ensure_gateway_service", lambda **kw: False)
     monkeypatch.setattr(gateway_mod, "_is_service_running", lambda: False)
     import hermes_cli.backup as backup_mod
 

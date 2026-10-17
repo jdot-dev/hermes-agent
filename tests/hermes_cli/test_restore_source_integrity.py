@@ -24,7 +24,10 @@ def _database(path, count):
 
 
 def _assert_no_decoy(tmp_path, home_name):
-    assert {p.name for p in tmp_path.iterdir()} <= {home_name, "native", "backup.zip", "hermes_test"}
+    # The shared fixture also creates an isolated supervisor scan directory.
+    assert {p.name for p in tmp_path.iterdir()} <= {
+        home_name, "native", "backup.zip", "hermes_test", "s6-scandir"
+    }
 
 
 @pytest.fixture(params=HOME_NAMES)
@@ -39,7 +42,8 @@ def home(tmp_path, monkeypatch, request):
     native.mkdir()
     (native / "config.yaml").write_text("{}", encoding="utf-8")
     monkeypatch.setattr(backup, "_get_platform_default_hermes_home", lambda: native)
-    monkeypatch.setattr(gateway, "ensure_gateway_service", lambda **kwargs: False)
+    from hermes_cli import gateway_setup_service
+    monkeypatch.setattr(gateway_setup_service, "ensure_gateway_service", lambda *args, **kwargs: False)
     monkeypatch.setattr(gateway, "_is_service_running", lambda: False)
     return home
 

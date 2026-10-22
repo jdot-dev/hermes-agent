@@ -162,7 +162,7 @@ def _primary_profile_routes_for_current_home() -> list:
         # (/etc/hermes/config.yaml) never reached the raw user-file read (#121212), so preflight
         # false-blocked and routed delivery failed closed on centrally-managed installs.
         from gateway.config_loader import read_yaml_layers
-        layered = read_yaml_layers(primary_home.expanduser())
+        layered = read_yaml_layers(primary_home.expanduser(), profile_routes_only=True)
         routes_raw = layered.get("profile_routes")
         if routes_raw is None and isinstance(layered.get("gateway"), dict):
             routes_raw = layered["gateway"].get("profile_routes")

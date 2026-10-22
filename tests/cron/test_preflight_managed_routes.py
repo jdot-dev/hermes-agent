@@ -63,3 +63,21 @@ def test_managed_routes_replace_user_file_routes(satellite_home):
     (managed_dir / "config.yaml").write_text(yaml.safe_dump(_routes(WA_ROUTE)), encoding="utf-8")
 
     assert [r.platform for r in _primary_profile_routes_for_current_home()] == ["whatsapp"]
+
+
+@pytest.mark.parametrize("nested", [False, True])
+def test_satellite_route_lookup_does_not_resolve_primary_credentials(satellite_home, caplog, nested):
+    """A credentialless satellite may inspect routes without resolving unrelated primary secrets."""
+    from agent.secret_scope import reset_secret_scope, set_secret_scope
+
+    root, _managed_dir = satellite_home
+    config = _routes(WA_ROUTE) if nested else {"profile_routes": [WA_ROUTE]}
+    config["a2a_agents"] = {"primary": {"auth": {"token": "${env:PRIMARY_PRIVATE_KEY}"}}}
+    config.setdefault("gateway", {})["unrelated_secret"] = "${env:PRIMARY_PRIVATE_KEY}"
+    (root / "config.yaml").write_text(yaml.safe_dump(config), encoding="utf-8")
+    token = set_secret_scope({}, profile_home=str(root / "profiles" / "sat"))
+    try:
+        assert [route.platform for route in _primary_profile_routes_for_current_home()] == ["whatsapp"]
+    finally:
+        reset_secret_scope(token)
+    assert "PRIMARY_PRIVATE_KEY" not in caplog.text

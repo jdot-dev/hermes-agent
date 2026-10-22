@@ -80,6 +80,51 @@ _RESPAWN_GUARD_SUCCESS_WINDOW = 3600  # 1 hour
 # ``HERMES_KANBAN_RATE_LIMIT_COOLDOWN_SECONDS``.
 DEFAULT_RATE_LIMIT_COOLDOWN_SECONDS = 300  # 5 minutes
 
+# 2026-10-21 (Jack, approved): exponential backoff + requeue cap for
+# rate-limited requeues. The flat cooldown above let one card bounce off a
+# quota wall 800+ times (t_31b28e35, t_e7810a78 on hera-ops-intake). The
+# cooldown now doubles per CONSECUTIVE rate-limited run (counted since the
+# last non-rate-limited run or explicit re-queue event), capped, with a
+# deterministic +/-20% jitter (stable across ticks, de-synchronises cards that
+# hit the wall together). After the requeue cap the card is parked blocked
+# with a reason; a human/agent re-queue (unblock) resets the streak.
+DEFAULT_RATE_LIMIT_BACKOFF_MAX_SECONDS = 6 * 3600  # 6 hours
+DEFAULT_RATE_LIMIT_MAX_REQUEUES = 12
+_RATE_LIMIT_JITTER = 0.2
+
+
+def _rate_limit_streak(conn: sqlite3.Connection, task_id: str) -> int:
+    """Consecutive trailing ``rate_limited`` runs, reset by an explicit re-queue event."""
+    reset = conn.execute(
+        "SELECT MAX(created_at) FROM task_events WHERE task_id = ? "
+        "AND kind IN ('status', 'promoted', 'unblocked', 'reclaimed')",
+        (task_id,),
+    ).fetchone()
+    reset_at = _kb._to_epoch(reset[0]) if reset is not None and reset[0] is not None else None
+    streak = 0
+    for r in conn.execute(
+        "SELECT outcome, ended_at FROM task_runs WHERE task_id = ? AND ended_at IS NOT NULL "
+        "ORDER BY ended_at DESC LIMIT 200",
+        (task_id,),
+    ):
+        if r["outcome"] != "rate_limited":
+            break
+        ended = _kb._to_epoch(r["ended_at"])
+        if reset_at is not None and ended is not None and ended < reset_at:
+            break
+        streak += 1
+    return streak
+
+
+def _rate_limit_backoff_seconds(base: int, streak: int, task_id: str) -> int:
+    """``base * 2**(streak-1)`` capped, times a deterministic jitter in [0.8, 1.2]."""
+    cap = max(base, _kb._env_int("HERMES_KANBAN_RATE_LIMIT_BACKOFF_MAX_SECONDS",
+                                 DEFAULT_RATE_LIMIT_BACKOFF_MAX_SECONDS))
+    raw = min(cap, base * (2 ** max(0, min(streak - 1, 30))))
+    import zlib
+    frac = (zlib.crc32(f"{task_id}:{streak}".encode()) % 10_000) / 10_000.0
+    return int(raw * (1.0 - _RATE_LIMIT_JITTER + 2 * _RATE_LIMIT_JITTER * frac))
+
 # Within this window a GitHub PR URL in a comment blocks re-spawn.
 _RESPAWN_GUARD_PR_WINDOW = 86400  # 24 hours
 
@@ -1601,8 +1646,14 @@ def check_respawn_guard(
             # Cooldown disabled — respawn immediately, skipping blocker_auth so
             # the stamped rate-limit text doesn't re-trap the task.
             return None
+        streak = _rate_limit_streak(conn, task_id)
+        max_requeues = _kb._env_int("HERMES_KANBAN_RATE_LIMIT_MAX_REQUEUES",
+                                    DEFAULT_RATE_LIMIT_MAX_REQUEUES)
+        if max_requeues > 0 and streak >= max_requeues:
+            return "rate_limit_exhausted"
         ended_at = _kb._to_epoch(latest_run["ended_at"])
-        if ended_at is not None and (now - ended_at) < rl_cooldown:
+        backoff = _rate_limit_backoff_seconds(rl_cooldown, streak, task_id)
+        if ended_at is not None and (now - ended_at) < backoff:
             return "rate_limit_cooldown"
         # Cooldown elapsed — return early so blocker_auth doesn't catch the
         # stamped rate-limit text; this path intentionally retries forever
@@ -2103,6 +2154,15 @@ def _dispatch_lane_task(
         # the operator's intent ("default") was perfectly clear (#27145). Mutating the row (not just the
         # in-memory view) keeps diagnostics and the board state consistent: the task is now legitimately
         # owned by ``kanban.default_assignee``, not "unassigned but secretly routed".
+        if not dry_run and guard_reason == "rate_limit_exhausted":
+            # Park the runaway instead of re-evaluating it every tick forever.
+            try:
+                _kb.block_task(conn, task_id, reason=(
+                    "parked: rate-limited requeue cap reached "
+                    "(HERMES_KANBAN_RATE_LIMIT_MAX_REQUEUES); unblock to retry"))
+            except Exception:
+                pass
+            return False
         if not dry_run:
             with _kb.write_txn(conn):
                 _kb._append_event(conn, task_id, "respawn_guarded", {"reason": guard_reason})

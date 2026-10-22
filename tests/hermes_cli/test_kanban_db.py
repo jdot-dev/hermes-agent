@@ -2082,3 +2082,36 @@ def test_archive_non_running_task_does_not_attempt_termination(kanban_home):
             (t,),
         ).fetchone()
         assert row is None
+
+
+def test_rate_limit_backoff_grows_and_caps_requeues(kanban_home, monkeypatch):
+    """2026-10-21: consecutive rate-limited requeues back off exponentially and park at the cap."""
+    from hermes_cli import kanban_db as _kb
+    from hermes_cli import kanban_db_dispatch as kbd
+    monkeypatch.setenv("HERMES_KANBAN_RATE_LIMIT_COOLDOWN_SECONDS", "300")
+    monkeypatch.setenv("HERMES_KANBAN_RATE_LIMIT_MAX_REQUEUES", "4")
+    now = 6_000_000
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="rl-backoff", assignee="a")
+        for i in range(3):
+            conn.execute(
+                "INSERT INTO task_runs (task_id, status, outcome, started_at, ended_at) "
+                "VALUES (?, 'rate_limited', 'rate_limited', ?, ?)",
+                (tid, now - 10 + i, now + i),
+            )
+        conn.execute("UPDATE tasks SET status='ready' WHERE id=?", (tid,))
+        conn.commit()
+        assert kbd._rate_limit_streak(conn, tid) == 3
+        # streak 3 -> 1200s +/-20%: still cooling at +900s, free at +1500s.
+        monkeypatch.setattr(_kb.time, "time", lambda: now + 900)
+        assert kbd.check_respawn_guard(conn, tid) == "rate_limit_cooldown"
+        monkeypatch.setattr(_kb.time, "time", lambda: now + 1500)
+        assert kbd.check_respawn_guard(conn, tid) is None
+        conn.execute(
+            "INSERT INTO task_runs (task_id, status, outcome, started_at, ended_at) "
+            "VALUES (?, 'rate_limited', 'rate_limited', ?, ?)",
+            (tid, now + 1600, now + 1700),
+        )
+        conn.commit()
+        assert kbd.check_respawn_guard(conn, tid) == "rate_limit_exhausted"
+    assert kbd._rate_limit_backoff_seconds(300, 40, "x") <= int(6 * 3600 * 1.2)

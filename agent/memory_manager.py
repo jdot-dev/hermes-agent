@@ -10,6 +10,7 @@ import contextvars
 import inspect
 import json
 import logging
+import math
 import re
 import threading
 from concurrent.futures import Future, ThreadPoolExecutor, wait
@@ -32,6 +33,23 @@ _LEGACY_PRE_COMPRESS_API_VERSION = 1
 # blocks interpreter exit.
 _SYNC_DRAIN_TIMEOUT_S = 5.0
 _EXTERNAL_PREFETCH_TIMEOUT_S = 8.0
+
+
+def configured_external_prefetch_timeout(value: Any) -> Optional[float]:
+    """Keep external recall available when a profile's optional deadline is invalid."""
+    if value is None:
+        return None
+    try:
+        timeout = float(value)
+    except (TypeError, ValueError, OverflowError):
+        timeout = float("nan")
+    if not math.isfinite(timeout) or timeout <= 0:
+        logger.warning(
+            "memory.external_prefetch_timeout_seconds must be finite and positive; "
+            "using the default external prefetch timeout"
+        )
+        return None
+    return timeout
 
 
 # -- Signature introspection (providers are duck-typed; call shapes vary) -----

@@ -1,7 +1,10 @@
 """Regression tests for memory provider selection during AIAgent init."""
 
 from types import SimpleNamespace
+import threading
 from unittest.mock import patch
+
+import pytest
 
 
 class RecordingMemoryProvider:
@@ -166,17 +169,21 @@ def test_core_tool_names_rejected_from_memory_routing_table():
 
 
 
-def test_aiagent_reuses_handed_in_memory_manager_without_reinitializing():
+def test_aiagent_reuses_handed_in_memory_manager_without_reinitializing(tmp_path, monkeypatch):
     """A caller that rebuilds the agent per turn (gateway api_server) hands back the session's manager:
     the provider keeps its state — no second load, no second initialize (#120116)."""
     provider = RecordingMemoryProvider()
-    cfg = {"memory": {"provider": "recording"}, "agent": {}}
+    from hermes_cli.config import atomic_config_write
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    atomic_config_write(tmp_path / "config.yaml", {"memory": {
+        "provider": "recording", "external_prefetch_timeout_seconds": 20,
+    }})
     common = dict(
         api_key="test-key-1234567890", base_url="https://openrouter.ai/api/v1", quiet_mode=True,
         skip_context_files=True, skip_memory=False, session_id="sess-api", platform="api_server",
     )
     with (
-        patch("hermes_cli.config.load_config", return_value=cfg), patch("hermes_cli.config.load_config_readonly", return_value=cfg),
         patch("plugins.memory.load_memory_provider", return_value=provider) as load_memory_provider,
         patch("agent.model_metadata.get_model_context_length", return_value=204_800),
         patch("model_tools.get_tool_definitions", return_value=[]),
@@ -188,10 +195,58 @@ def test_aiagent_reuses_handed_in_memory_manager_without_reinitializing():
         first = AIAgent(**common)
         manager = first._memory_manager
         assert manager is not None and load_memory_provider.call_count == 1
+        assert manager._external_prefetch_timeout == 20
         provider.init_session_id = None  # a re-initialize would set it again
+        atomic_config_write(tmp_path / "config.yaml", {"memory": {
+            "provider": "recording", "external_prefetch_timeout_seconds": 40,
+        }})
 
         second = AIAgent(memory_manager=manager, **common)
 
     assert second._memory_manager is manager
     assert load_memory_provider.call_count == 1
     assert provider.init_session_id is None
+    assert manager._external_prefetch_timeout == 20
+
+
+@pytest.mark.parametrize("configured, expected", [
+    (None, 8.0), (20, 20.0), (0.25, 0.25), ("12.5", 12.5),
+    ("invalid", 8.0), (float("nan"), 8.0), (float("inf"), 8.0),
+    (float("-inf"), 8.0), (0, 8.0), (-1, 8.0),
+])
+def test_profile_prefetch_timeout_reaches_external_wait(tmp_path, monkeypatch, configured, expected):
+    """Profile YAML controls the real prefetch deadline; invalid values keep recall enabled."""
+    from hermes_cli.config import atomic_config_write
+    from run_agent import AIAgent
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    memory = {"provider": "recording", "memory_enabled": False, "user_profile_enabled": False}
+    if configured is not None:
+        memory["external_prefetch_timeout_seconds"] = configured
+    atomic_config_write(tmp_path / "config.yaml", {"memory": memory})
+    provider = RecordingMemoryProvider()
+    provider.prefetch = lambda query, **kwargs: "source-linked recall"
+    with (
+        patch("plugins.memory.load_memory_provider", return_value=provider),
+        patch("agent.model_metadata.get_model_context_length", return_value=204_800),
+        patch("model_tools.get_tool_definitions", return_value=[]),
+        patch("model_tools.check_toolset_requirements", return_value={}),
+        patch("agent.process_bootstrap.OpenAI"),
+    ):
+        agent = AIAgent(
+            api_key="test-key-1234567890", base_url="http://127.0.0.1:1/v1",
+            quiet_mode=True, skip_context_files=True, skip_memory=False,
+        )
+
+    assert agent._memory_manager is not None
+    deadlines = []
+    join = threading.Thread.join
+
+    def record_join(thread, timeout=None):
+        deadlines.append(timeout)
+        join(thread, timeout)
+
+    with patch.object(threading.Thread, "join", record_join):
+        result = agent._memory_manager.prefetch_all("operational fact")
+    assert result == "source-linked recall"
+    assert deadlines == [expected]

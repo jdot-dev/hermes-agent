@@ -1315,9 +1315,9 @@ DEFAULT_CONFIG = {
         "memory_enabled": True,
         "user_profile_enabled": True,
         "prefetch_spill_enabled": False,  # External recall opt-in to hooks.output_spill.
-        # Approval gate for memory writes on BOTH foreground turns and the background review fork.
-        # true = foreground writes prompt inline; background writes are staged (/memory
-        # pending|approve <id>|reject <id>). To disable memory: memory_enabled.
+        "external_prefetch_timeout_seconds": 8.0,  # Bound each external provider's foreground recall.
+        # Foreground writes prompt inline; background writes are staged for /memory pending|approve|reject.
+        # Applies to both foreground and background review. To disable memory: memory_enabled.
         "write_approval": False,
         "memory_char_limit": 2200,   # ~800 tokens at 2.75 chars/token
         "user_char_limit": 1375,     # ~500 tokens at 2.75 chars/token

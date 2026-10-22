@@ -291,6 +291,7 @@ memory:
   user_char_limit: 1375     # ~500 tokens
   write_approval: false     # false = write freely (default) | true = require approval
   prefetch_spill_enabled: false  # external recall stays intact unless explicitly enabled
+  external_prefetch_timeout_seconds: 8.0  # foreground wait for each external provider
 ```
 
 Setting **both** `memory_enabled` and `user_profile_enabled` to `false` turns the
@@ -307,6 +308,16 @@ it backs the profile store — but the system prompt swaps the full memory
 guidance for a narrower profile-only block. The tool schema advertises only the
 `user` target, and direct or staged writes to disabled `MEMORY.md` are rejected.
 The inverse configuration advertises only `memory` and rejects `USER.md` writes.
+
+### External recall timeout
+
+`memory.external_prefetch_timeout_seconds` bounds the foreground wait for an
+external provider's recall. Set a finite positive number of seconds in the active
+profile's config when its backend needs more time. The default is eight seconds;
+invalid values log a warning and use that default. A timed-out recall is skipped
+until its pending call finishes, so a stalled backend cannot block every turn.
+The setting applies when a new memory manager is created; an existing session's
+manager keeps its original deadline. Built-in file memory is unaffected.
 
 ### External recall size
 

@@ -1342,17 +1342,17 @@ def _init_memory(agent, _agent_cfg, skip_memory, platform, memory_manager=None):
     # External memory provider plugin (one at a time, alongside built-in): memory.provider.
     agent._memory_manager = None
     if memory_manager is not None and not skip_memory:
-        # A caller that rebuilds the agent per turn (gateway api_server) hands back the session's
-        # already-initialized manager: providers keep their prefetch/retain state across turns instead
-        # of being re-initialized (#120116). No initialize_all — the providers are already bound.
+        # Rebuilt gateway agents reuse the bound manager so provider state and its configured
+        # timeout survive across turns (#120116). No initialize_all — providers are already bound.
         agent._memory_manager = memory_manager
     elif not skip_memory:
         try:
             _mem_provider_name = mem_config.get("provider", "") if mem_config else ""
             if not is_core_memory_provider(_mem_provider_name):
-                from agent.memory_manager import MemoryManager as _MemoryManager
+                from agent.memory_manager import MemoryManager as _MemoryManager, configured_external_prefetch_timeout
                 from plugins.memory import load_memory_provider as _load_mem
-                agent._memory_manager = _MemoryManager()
+                agent._memory_manager = _MemoryManager(external_prefetch_timeout=configured_external_prefetch_timeout(
+                    mem_config.get("external_prefetch_timeout_seconds")))
                 _mp = _load_mem(_mem_provider_name)
                 if _mp is None:
                     # The provider left core for the catalog (or was never installed): fetch it once.

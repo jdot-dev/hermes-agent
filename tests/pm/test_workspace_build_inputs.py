@@ -12,6 +12,38 @@ from tests.pm import _fixtures
 from pm.environment import managed_environment
 
 
+def test_identical_virtual_profiles_share_dependencies_but_keep_independent_inputs(tmp_path):
+    import tomllib
+
+    core = tmp_path / "core"
+    core.mkdir()
+    (core / "pyproject.toml").write_text('[project]\nname="core"\nversion="1"\n[tool.uv]\npackage=false\n')
+    plugins = [tmp_path / name / "plugins" / "memory" for name in ("one", "two")]
+    metadata = ('[project]\nname="memory-plugin"\nversion="1"\ndependencies=[]\n'
+                '[dependency-groups]\ndev=["pytest>=8,<9"]\n[tool.uv]\npackage=false\n')
+    for plugin in plugins:
+        plugin.mkdir(parents=True)
+        (plugin / "plugin.yaml").write_text('name: memory\n')
+        (plugin / "pyproject.toml").write_text(metadata)
+        (plugin / "__init__.py").write_text('# profile-owned runtime\n')
+    before = workspace.members_stamp(plugins)
+    root = tmp_path / "generated"
+    workspace._generate_pyproject(plugins, root, source=core)
+    generated = tomllib.loads((root / "pyproject.toml").read_text())
+    assert len(generated["tool"]["uv"]["workspace"]["members"]) == 1
+    assert all((plugin / "pyproject.toml").read_text() == metadata for plugin in plugins)
+    (plugins[1] / "__init__.py").write_text('# independently updated runtime\n')
+    assert workspace.members_stamp(plugins) != before
+    # Distinct requirements, build backends and path-sensitive policy cannot merge.
+    (plugins[1] / "pyproject.toml").write_text(metadata.replace('pytest>=8,<9', 'pytest>=9,<10'))
+    assert len(list(workspace._dependency_members(plugins))) == 2
+    for suffix in ('[build-system]\nrequires=[]\nbuild-backend="backend"\n',
+                   '[tool.uv.sources]\nfoo={path="../local"}\n'):
+        for plugin in plugins:
+            (plugin / "pyproject.toml").write_text(metadata + suffix)
+        assert len(list(workspace._dependency_members(plugins))) == 2
+
+
 
 
 def _buildable_source(plugin):

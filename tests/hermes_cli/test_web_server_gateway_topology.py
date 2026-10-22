@@ -71,6 +71,33 @@ def _patch_topology(monkeypatch, homes, running, runtimes):
 
 
 class TestCollectProfileGatewayTopology:
+    @pytest.mark.parametrize("multiplex", [False, True])
+    @pytest.mark.parametrize("secondary_first", [False, True])
+    def test_standalone_secondary_does_not_set_the_host_guard_reason(
+        self, tmp_path, monkeypatch, multiplex, secondary_first,
+    ):
+        homes = [("default", tmp_path / "d"), ("coder", tmp_path / "c"), ("solo", tmp_path / "s")]
+        if secondary_first:
+            homes.reverse()
+        primary_reason = None if multiplex else "duplicate bot credentials"
+        runtimes = {
+            "default": {
+                "served_profiles": ["default", "coder"] if multiplex else [],
+                "multiplex_standalone_reason": primary_reason,
+            },
+            "solo": {
+                "multiplex_standalone_reason": "this profile is standalone; it serves only itself",
+            },
+        }
+        _patch_topology(monkeypatch, homes, running={"default", "solo"}, runtimes=runtimes)
+        monkeypatch.setattr(_web_server_gateway, "_has_own_gateway", lambda home: home == tmp_path / "s")
+
+        topo = _collect_profile_gateway_topology()
+
+        assert topo["gateway_mode"] == ("multiplex" if multiplex else "multiple")
+        assert topo["multiplex_standalone_reason"] == primary_reason
+        assert {entry["profile"] for entry in topo["gateways"]} == {"default", "solo"}
+
     def test_running_standalone_profile_is_in_topology(self, tmp_path, monkeypatch):
         from hermes_cli import profiles
 

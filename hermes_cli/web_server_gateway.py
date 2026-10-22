@@ -194,7 +194,9 @@ def _collect_profile_gateway_topology() -> dict[str, Any]:
         served = [str(p) for p in ((runtime or {}).get("served_profiles") or [])]
         if name == "default" and len(served) > 1:
             multiplex = True
-        if (runtime or {}).get("multiplex_standalone_reason"):
+        # The host warning belongs to the default gateway. A standalone secondary
+        # can coexist with a healthy multiplexer without making its roster unserved.
+        if name == "default" and not multiplex and (runtime or {}).get("multiplex_standalone_reason"):
             standalone_reason = str(runtime["multiplex_standalone_reason"])
         plats = (runtime or {}).get("platforms")
         owned: dict = {}

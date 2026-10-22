@@ -119,9 +119,8 @@ def _generate_pyproject(plugin_dirs: list[Path] | Mapping[Path, Path], root: Pat
     core_pyproject = source / "pyproject.toml"
     core_text = core_pyproject.read_text(encoding="utf-8-sig")
 
-    members = [_workspace_member(source, root, identity=identity).relative_to(root).as_posix()
-               for identity, source in member_sources(plugin_dirs).items()
-               if _is_member_candidate(source)]
+    members = [_workspace_member(entry, root, identity=identity).relative_to(root).as_posix()
+               for identity, entry in _dependency_members(plugin_dirs)]
 
     if members:
         import tomllib
@@ -187,6 +186,39 @@ def _without_release_age(text: str) -> str:
 
 def _is_member_candidate(plugin_dir: Path) -> bool:
     return read_python_declaration(plugin_dir).is_member
+
+
+def _dependency_members(plugin_dirs):
+    """Coalesce identical virtual declarations, never profile runtime state.
+
+    Repeated copies otherwise multiply independent dev/test conflict selectors
+    and can stall uv before version solving. Virtual members install no code.
+    The input stamp still includes every identity and source; buildable packages
+    and declarations with potentially path-dependent requirements stay distinct.
+    """
+    import json
+    import tomllib
+
+    seen = set()
+    for identity, entry in member_sources(plugin_dirs).items():
+        declaration = read_python_declaration(entry)
+        if not declaration.is_member:
+            continue
+        key = None
+        if declaration.pyproject is not None:
+            document = tomllib.loads(declaration.pyproject.read_text(encoding="utf-8-sig"))
+            policy = document.get("tool", {}).get("uv", {})
+            project = document.get("project", {})
+            serialized = json.dumps(document, sort_keys=True)
+            if ("build-system" not in document and policy.get("package") is not True
+                    and not (set(policy) - {"package"}) and not project.get("dynamic")
+                    and "@" not in serialized and "file:" not in serialized):
+                key = (serialized, declaration.install_requirements, declaration.requires_python)
+        if key is not None:
+            if key in seen:
+                continue
+            seen.add(key)
+        yield identity, entry
 
 
 def enabled_plugin_entries(*, proposed_home=None, enabled=None, disabled=None,

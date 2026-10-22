@@ -518,9 +518,11 @@ class _ToolHandlers:
             entry_platform = entry.get("platform") or origin.get("platform", "")
             if not _platform_matches(platform, entry_platform):
                 continue
-            display_name = entry.get("display_name", "")
-            chat_name = origin.get("chat_name", "")
-            if search and not any(search.lower() in s.lower() for s in (display_name, chat_name, key)):
+            # Session metadata can contain explicit nulls. Normalize before search;
+            # one malformed conversation must not break the whole listing.
+            display_name = entry.get("display_name") or ""
+            chat_name = origin.get("chat_name") or ""
+            if search and not any(search.lower() in str(s).lower() for s in (display_name, chat_name, key)):
                 continue
             conversations.append({
                 "session_key": key, "session_id": entry.get("session_id", ""), "platform": entry_platform,

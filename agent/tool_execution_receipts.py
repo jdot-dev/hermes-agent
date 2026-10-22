@@ -46,12 +46,15 @@ def _maybe_record_action_receipt(
             cwd = None
 
         session_id = getattr(agent, "session_id", "") or None
+        from agent.model_execution_receipts import receipt_task_id
+
+        receipt_task = receipt_task_id(effective_task_id)
         envelope = build_shadow_envelope(
             tool_name=function_name,
             args=function_args,
             cwd=str(cwd) if cwd else None,
             session_id=session_id,
-            task_id=effective_task_id or None,
+            task_id=receipt_task,
             tool_call_id=tool_call_id or None,
         )
         receipt_cwd = getattr(envelope, "cwd", None)
@@ -62,7 +65,7 @@ def _maybe_record_action_receipt(
             exit_status=exit_status,
             duration_ms=int(duration_s * 1000),
             session_id=session_id,
-            task_id=effective_task_id or None,
+            task_id=receipt_task,
             tool_call_id=tool_call_id or None,
             cwd=receipt_cwd,
             envelope=envelope,

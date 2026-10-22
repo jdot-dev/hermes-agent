@@ -1542,7 +1542,7 @@ def _collect_history_media_paths(agent_history: list[dict[str, Any]]) -> set:
     return paths
 
 def _home_target_env_var(platform_name: str) -> str:
-    """Home-target env var: built-in ``_HOME_TARGET_ENV_VARS``, plugin registry, then
+    """Home-target env var: the plugin's ``cron_deliver_env_var``, then
     ``<PLATFORM>_HOME_CHANNEL``."""
     from cron.scheduler_delivery import _resolve_home_env_var
     return _resolve_home_env_var(platform_name) or f"{platform_name.upper()}_HOME_CHANNEL"
@@ -1788,13 +1788,13 @@ def _load_profile_secret_scope(profile_home: Path) -> dict:
     """Hydrate and load one profile's secrets under its home override."""
     from hermes_constants import set_hermes_home_override, reset_hermes_home_override
     # Caller already hydrated external sources off-loop (#99519).
-    from agent.secret_scope import build_profile_secret_scope
     from hermes_cli.env_loader import hydrate_profile_secret_sources
+    from tui_gateway.launch_profile_policy import owner_secret_scope
 
     home_token = set_hermes_home_override(str(profile_home))
     try:
         hydrate_profile_secret_sources(Path(profile_home))
-        return build_profile_secret_scope(Path(profile_home))
+        return owner_secret_scope(Path(profile_home))
     finally:
         reset_hermes_home_override(home_token)
 
@@ -1818,8 +1818,8 @@ def _profile_runtime_scope(
         elif hydrate_secrets:
             secrets = _load_profile_secret_scope(Path(profile_home))
         else:
-            from agent.secret_scope import build_profile_secret_scope  # caller already hydrated off-loop
-            secrets = build_profile_secret_scope(Path(profile_home))
+            from tui_gateway.launch_profile_policy import owner_secret_scope  # caller already hydrated off-loop
+            secrets = owner_secret_scope(Path(profile_home))
         secret_token = set_secret_scope(secrets, profile_home=str(profile_home))
         # Install the routed profile's COMPLETE terminal policy, never ambient TERMINAL_* a prior turn set.
         # Without it terminal_tool reads the process-global TERMINAL_* vars a previous profile's turn may have
@@ -2006,7 +2006,6 @@ def _bridge_terminal_config_to_env(_terminal_cfg: dict) -> None:
         "lifetime_seconds": "TERMINAL_LIFETIME_SECONDS",
         "docker_image": "TERMINAL_DOCKER_IMAGE",
         "docker_forward_env": "TERMINAL_DOCKER_FORWARD_ENV",
-        "singularity_image": "TERMINAL_SINGULARITY_IMAGE",
         "modal_image": "TERMINAL_MODAL_IMAGE",
         "daytona_image": "TERMINAL_DAYTONA_IMAGE",
         "vercel_runtime": "TERMINAL_VERCEL_RUNTIME",
@@ -2197,7 +2196,7 @@ from gateway.run_turn import GatewayTurnMixin, is_context_overflow_failure_resul
 from gateway.run_shutdown import GatewayShutdownMixin, _resolve_gateway_exit_verdict
 from gateway.run_busy import GatewayBusySessionMixin
 from gateway.run_config_loaders import GatewayConfigLoadersMixin
-from gateway.run_startup import GatewayStartupMixin
+from gateway.run_startup import GatewayStartupMixin, _own_policy_envs
 from gateway.run_watchers import GatewaySessionWatchersMixin
 from gateway.run_notifications import GatewayNotificationsMixin
 from gateway.run_inbound import GatewayInboundMixin
@@ -2236,20 +2235,15 @@ def _best_effort(fn: Callable[[], Any], debug_msg: Optional[str] = None) -> Any:
 _EXECUTOR_QUIESCE_TIMEOUT = 2.0
 
 
-_OWN_POLICY_OPEN_ENV = {
-    Platform.WECOM: ("WECOM_DM_POLICY", "WECOM_GROUP_POLICY", "WECOM_ALLOW_ALL_USERS"),
-    Platform.WEIXIN: ("WEIXIN_DM_POLICY", "WEIXIN_GROUP_POLICY", "WEIXIN_ALLOW_ALL_USERS"),
-    Platform.YUANBAO: ("YUANBAO_DM_POLICY", "YUANBAO_GROUP_POLICY", "YUANBAO_ALLOW_ALL_USERS"),
-    Platform.QQBOT: (None, None, "QQ_ALLOW_ALL_USERS"),
-    Platform.WHATSAPP: ("WHATSAPP_DM_POLICY", "WHATSAPP_GROUP_POLICY", "WHATSAPP_ALLOW_ALL_USERS")}
-
-
 def _own_policy_open_startup_violation(config) -> Optional[str]:
     """Return a startup-abort reason when open policy lacks allow-all opt-in."""
+    with suppress(Exception):  # idempotent; callers may hand in a config load_gateway_config never built
+        from hermes_cli.plugins import discover_plugins
+        discover_plugins()
     for platform, platform_config in getattr(config, "platforms", {}).items():
         if not getattr(platform_config, "enabled", False):
             continue
-        open_env = _OWN_POLICY_OPEN_ENV.get(platform)
+        open_env = _own_policy_envs(platform)
         if not open_env:
             continue
         dm_env, group_env, allow_all_env = open_env
@@ -2903,15 +2897,14 @@ from gateway.session_worker_construct import checkpoint_agent_kwargs as _checkpo
 
 
 def _resolve_gateway_model(config: dict | None = None) -> str:
-    """Read model from config.yaml (single source of truth), else temporary AIAgents (e.g. /compress)
-    use the hardcoded default, which fails under openai-codex."""
-    cfg = config if config is not None else _load_gateway_config()
-    model_cfg = cfg.get("model", {})
-    if isinstance(model_cfg, str):
-        return model_cfg
-    elif isinstance(model_cfg, dict):
-        return model_cfg.get("default") or model_cfg.get("model") or ""
-    return ""
+    """The profile's model when nothing else names one: config.yaml (single source of truth), else the
+    claimed welcome trial's. Temporary AIAgents (e.g. /compress) otherwise use the hardcoded default,
+    which fails under openai-codex."""
+    from hermes_cli.anon_auth import trial_model
+    model_cfg = (config if config is not None else _load_gateway_config()).get("model", {})
+    if isinstance(model_cfg, dict):
+        model_cfg = model_cfg.get("default") or model_cfg.get("model")
+    return (model_cfg if isinstance(model_cfg, str) else "") or trial_model()
 
 
 def _channel_override_lookup_keys(
@@ -4210,7 +4203,7 @@ class GatewayRunner(
                 logger.warning(
                     "Rejecting profile route %r: target profile %r is not served",
                     matched.name, matched.profile)
-                raise ProfileRouteRejected(matched.name)
+                raise ProfileRouteRejected(matched.name, matched.profile)
             return matched.profile
         logger.debug(
             "No profile route matched: platform=%s chat_id=%s thread_id=%s parent_chat_id=%s",

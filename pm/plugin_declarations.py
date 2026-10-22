@@ -58,6 +58,9 @@ class PythonDeclaration:
     requirements: tuple[str, ...]
     manifest: dict
     requires_python: str | None = None
+    # The pyproject itself installs something: the plugin as a package, or extras/dependency groups
+    # (``uv sync --all-packages`` installs a member's default groups as well as its dependencies).
+    pyproject_installs: bool = False
 
     @property
     def external(self) -> bool:
@@ -66,6 +69,12 @@ class PythonDeclaration:
     @property
     def install_requirements(self) -> tuple[str, ...]:
         return () if self.external else applicable_requirements(self.requirements)
+
+    @property
+    def installs_packages(self) -> bool:
+        """Admission would put packages into the shared environment, the thing dependency consent
+        is about. ``dependencies = []`` installs nothing, so it asks no more than no pyproject does."""
+        return not self.external and (bool(self.install_requirements) or self.pyproject_installs)
 
     @property
     def is_member(self) -> bool:
@@ -140,8 +149,9 @@ def read_python_declaration(plugin_dir: Path) -> PythonDeclaration:
             document = tomllib.loads(text)
             # A tooling-only pyproject (pytest, ruff, etc.) is not a package.
             # Keep it in the fingerprint, but let the manifest supply any deps.
+            uv = document.get("tool", {}).get("uv", {})
             packaged = ("project" in document or "build-system" in document
-                        or document.get("tool", {}).get("uv", {}).get("package") is True)
+                        or uv.get("package") is True)
             if packaged:
                 specs = document.get("project", {}).get("dependencies", [])
                 if not isinstance(specs, list) or any(not isinstance(v, str) for v in specs):
@@ -149,7 +159,12 @@ def read_python_declaration(plugin_dir: Path) -> PythonDeclaration:
                 requires_python = document.get("project", {}).get("requires-python")
                 if requires_python is not None and not isinstance(requires_python, str):
                     raise ValueError(f"invalid project.requires-python: {project}")
-                return PythonDeclaration(tuple(files), project, tuple(specs), manifest, requires_python)
+                installs = ("build-system" in document or uv.get("package") is True
+                            or any(document.get("project", {}).get("optional-dependencies", {}).values())
+                            or any(document.get("dependency-groups", {}).values())
+                            or bool(uv.get("dev-dependencies")))
+                return PythonDeclaration(
+                    tuple(files), project, tuple(specs), manifest, requires_python, installs)
     specs = []
     for key in ("pip_dependencies", "python_dependencies"):
         values = manifest.get(key, [])

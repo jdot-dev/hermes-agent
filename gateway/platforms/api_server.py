@@ -138,6 +138,8 @@ from gateway.config import Platform, PlatformConfig
 from gateway.display_config import resolve_display_setting
 from gateway.platforms import api_server_room_dispatch as _room_dispatch
 from gateway.platforms import api_server_room_grants as _room_grants
+from gateway.platforms import api_server_linked_child as _linked_child
+from gateway.platforms import api_server_passive_history as _passive_history
 from gateway.platforms import api_server_runs as _api_runs
 from gateway.platforms.api_server_openai_routes import OpenAICompatRoutesMixin
 from gateway.platforms.api_server_memory_sessions import ApiServerMemorySessions
@@ -1653,6 +1655,7 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             ("GET", "/v1/models", self._handle_models),
             ("GET", "/api/model/options", self._handle_model_options),
             ("GET", "/v1/capabilities", self._handle_capabilities),
+            *_passive_history._http_routes(self),
             # Browser-control (gated on browser.extension_control.enabled + API key): POST
             # mints a short-lived ticket, WS consumes it; artifacts are bounded + scope-bound.
             ("POST", "/v1/browser-control/register", self._handle_browser_control_register),
@@ -2451,6 +2454,10 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             return _error_response("Failed to list model options.", 500, code="model_options_failed")
 
     @_require_auth
+    async def _handle_passive_history(self, request: web.Request) -> web.Response:
+        return await _passive_history.handle(self, request)
+
+    @_require_auth
     async def _handle_capabilities(self, request: web.Request) -> web.Response:
         """GET /v1/capabilities — the stable, machine-readable API surface for external UIs."""
         runner = getattr(self, "gateway_runner", None)
@@ -2458,6 +2465,7 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             "chat_completions": True, "chat_completions_streaming": True,
             "responses_api": True, "responses_streaming": True, "run_submission": True,
             "runs_idempotency": _api_runs._idempotency_capabilities(self, store_type=RunIdempotencyStore),
+            "linked_child_dispatch": _linked_child.linked_child_feature(),
             **_STATIC_FEATURE_FLAGS,
             "run_unknown_resolution": getattr(runner, "session_authority", None) is not None,
             "cors": bool(self._cors_origins),

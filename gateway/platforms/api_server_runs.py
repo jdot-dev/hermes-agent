@@ -278,6 +278,8 @@ def _set_run_status(self, run_id: str, status: str, **fields: Any) -> dict[str, 
         current.setdefault("shutdown_requested_at", shutdown_requested_at)
     if status != "waiting_for_approval":
         current.pop("approval", None)
+    from gateway.platforms.api_server_linked_child import overlay_status
+    overlay_status(current)
     self._run_statuses[run_id] = current
     should_persist = (
         status != previous_status
@@ -731,6 +733,12 @@ async def _handle_runs(self, request: web.Request, *, _api_server) -> web.Respon
     body, room_error = await self._normalize_room_dispatch(request, body)
     if room_error is not None:
         return room_error
+    from gateway.platforms.api_server_linked_child import prepare_linked_child
+    linked = await prepare_linked_child(self, body)
+    if isinstance(linked, web.Response):
+        return linked
+    if linked is not None:
+        body = linked
     room_dispatch, room_execution_policy = (
         v if isinstance(v, dict) else None for v in (
             (body.get("hosted_room_dispatch"), body.get("_room_execution_policy"))

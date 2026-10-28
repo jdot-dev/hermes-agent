@@ -117,6 +117,17 @@ def _lift_common_custom_fields(entry: dict[str, Any], result: dict[str, Any], *,
         result["api_mode"] = api_mode
 
     _lift_model_capabilities(entry, None, result)
+    # Keep output reservations model-scoped: the runtime passes this value to
+    # both request construction and the context compressor.
+    models = entry.get("models")
+    if isinstance(models, dict):
+        limits = {
+            model: cfg["max_tokens"] for model, cfg in models.items()
+            if isinstance(cfg, dict) and type(cfg.get("max_tokens")) is int
+            and cfg["max_tokens"] > 0
+        }
+        if limits:
+            result["model_output_limits"] = limits
 
 
 # ── config lookup ──────────────────────────────────────────────────────────────────────────
@@ -510,6 +521,9 @@ def _apply_custom_provider_extras(custom_provider: dict[str, Any], target_model:
     model_name = target_model or custom_provider.get("model")
     if model_name:
         result["model"] = model_name
+    output_limits = custom_provider.get("model_output_limits", {})
+    if model_name in output_limits:
+        result["max_tokens"] = output_limits[model_name]
     _lift_model_capabilities(custom_provider, model_name, result)
 
     if custom_provider.get("extra_headers"):

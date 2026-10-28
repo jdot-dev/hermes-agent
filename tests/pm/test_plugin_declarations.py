@@ -92,7 +92,7 @@ def test_tooling_only_plugin_has_no_python_workspace_member(tmp_path):
     project = tmp_path / "pyproject.toml"
     project.write_text('[tool.pytest.ini_options]\ntestpaths=["tests"]\n', encoding="utf-8")
     declaration = read_python_declaration(tmp_path)
-    assert not declaration.is_member
+    assert not declaration.installs_packages
     assert project in declaration.files, "tooling configuration still contributes to currency"
 
 

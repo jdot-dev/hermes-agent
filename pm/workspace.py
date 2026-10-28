@@ -251,7 +251,7 @@ def _dependency_members(plugin_dirs):
     seen = set()
     for identity, entry in member_sources(plugin_dirs).items():
         declaration = read_python_declaration(entry)
-        if not declaration.is_member:
+        if not declaration.installs_packages:
             continue
         key = None
         if declaration.pyproject is not None:

@@ -119,6 +119,12 @@ def _hermes_home_points_at_production(value: str) -> bool:
 # system default so the import-time hook stays a no-op. The parallel runner
 # exports its own disk-backed TMPDIR anyway.
 from hermes_constants import SCRATCH_DIR_MARKER_ENV, SCRATCH_TMP_ENV_VARS
+import hermes_constants
+
+# The hourly scratch prune runs in a detached child process. An import-time boot hook during
+# collection must not start one: mark this process's once-per-process prune done. Tests that
+# reload hermes_constants reset that flag, so the per-test fixture below stubs the spawn itself.
+hermes_constants._scratch_pruned_once = True
 
 _HERMES_EXPORTED_TMP = os.environ.get(SCRATCH_DIR_MARKER_ENV, "")
 if _HERMES_EXPORTED_TMP:
@@ -712,6 +718,18 @@ def _kanban_write_guard(_hermetic_environment, monkeypatch):
     monkeypatch.setattr(_kdbc, "connect", _guarded_connect)
 
 
+@pytest.fixture(autouse=True)
+def scratch_prune_spawns(monkeypatch):
+    """No test starts a real detached scratch prune (one would outlive the test, and get any
+    Popen mock the test installed): ``spawn_prune`` only records the scratch dir it was given.
+    A test that needs the real child runs a launcher in a subprocess."""
+    import hermes_constants_scratch_detach
+
+    spawned: list = []
+    monkeypatch.setattr(hermes_constants_scratch_detach, "spawn_prune", spawned.append)
+    return spawned
+
+
 # ── Live state.db write guard ───────────────────────────────────────────────
 # Companion to the kanban guard above, for the MAIN state database.
 # ``hermes_state._ensure_test_isolation`` (the single choke point every
@@ -1179,7 +1197,7 @@ def pytest_unconfigure(config):
 
 
 @pytest.hookimpl(trylast=True)  # after _pytest.tmpdir has built config._tmp_path_factory
-def pytest_configure(config):  # noqa: D401 — pytest hook
+def pytest_configure(config):
     """Register markers and isolate live s6 before collection starts."""
     _relocate_basetemp_outside_operator_home(config)
     global _TEST_S6_SCANDIR
@@ -1269,7 +1287,7 @@ def pytest_configure(config):  # noqa: D401 — pytest hook
         config.option.timeout_method = "thread"
 
 
-def pytest_unconfigure(config):  # noqa: D401 — pytest hook
+def pytest_unconfigure(config):
     """Remove the process-wide temporary s6 scandir."""
     _remove_relocated_basetemp(config)
     global _TEST_S6_SCANDIR
@@ -1401,6 +1419,45 @@ def _audio_playback_guard(request, monkeypatch):
         monkeypatch.setattr(_voice, "play_audio_file", _blocked_play_audio_file)
 
     yield
+
+
+# ── Live Nous services fence ─────────────────────────────────────────────────
+# A test home starts with no Nous identity, so any path that ends in a hosted
+# connector action (connect, rename, status, the tool's first call) mints a REAL
+# guest on the production Portal: up to GUEST_MINT_TIMEOUT_SECONDS per test,
+# red whenever the Portal is slow, and a new guest identity on production on
+# every CI run. The same holds for billing, plan limits, the dashboard OAuth
+# provider and every other client built on a Nous URL. Refusing the name lookup
+# covers all of them at once (httpx, urllib, aiohttp and asyncio all resolve
+# through socket.getaddrinfo), and fails exactly like an offline host, which is
+# the path production already handles. Tests of these clients stub the
+# transport (tests/hermes_cli/anon_portal.py routes httpx at a fake Portal), so
+# they never reach the lookup. Live canaries opt in with ``@pytest.mark.live``.
+_NOUS_SERVICE_DOMAINS = ("nousresearch.com", "staging-nousresearch.com")
+
+
+def _is_nous_service_host(host) -> bool:
+    name = (host.decode() if isinstance(host, bytes) else str(host or "")).lower().rstrip(".")
+    return any(name == domain or name.endswith("." + domain) for domain in _NOUS_SERVICE_DOMAINS)
+
+
+@pytest.fixture(autouse=True)
+def _no_live_nous_services(request, monkeypatch):
+    if request.node.get_closest_marker("live"):
+        return
+    import socket
+
+    real_getaddrinfo = socket.getaddrinfo
+
+    def fenced_getaddrinfo(host, *args, **kwargs):
+        if _is_nous_service_host(host):
+            raise socket.gaierror(
+                socket.EAI_NONAME,
+                f"test fence: {host!r} is a live Nous service; stub the HTTP layer "
+                "(tests/hermes_cli/anon_portal.py) or mark the test live")
+        return real_getaddrinfo(host, *args, **kwargs)
+
+    monkeypatch.setattr(socket, "getaddrinfo", fenced_getaddrinfo)
 
 
 @pytest.fixture(autouse=True)

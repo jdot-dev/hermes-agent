@@ -11,8 +11,8 @@ import type { SessionInfo } from '../types.js'
 
 // A canonical gateway's create/resume snapshot carries main's banner inventory
 // (gateway/session_local_inventory.py). The TUI renders main's banner from it
-// unchanged: tools by toolset, skills by category, MCP servers, and the
-// "N tools · M skills · K MCP" footer — never a narrow-snapshot placeholder.
+// as collapsed headers: tools (count + toolsets), skills by category, and MCP
+// servers peeked by name with a connected/total count — never a placeholder.
 
 const delay = (ms: number) => new Promise(resolve => setTimeout(resolve, ms))
 
@@ -91,13 +91,9 @@ describe('banner from a canonical session snapshot', () => {
     expect(frame).toContain('v0.18.0 (2026.9.24)')
     expect(frame).toContain('claude-opus-5.5')
     expect(frame).toContain('/work/repo')
-    expect(frame).toMatch(/file: patch, read_file, search_files, write_file/)
-    expect(frame).toMatch(/terminal: process, terminal/)
-    expect(frame).toMatch(/Available Skills/)
-    expect(frame).toMatch(/MCP Servers/)
-    expect(frame).toMatch(/6 tools/)
-    expect(frame).toMatch(/3 skills/)
-    expect(frame).toMatch(/1 MCP/)
+    expect(frame).toMatch(/Tools \(6\) in 2 toolsets/)
+    expect(frame).toMatch(/Skills \(3\)/)
+    expect(frame).toMatch(/MCP 1\/2 ● linear {2}● nous-support/)
     expect(frame).not.toMatch(/not exposed by this runtime/)
   })
 
@@ -111,8 +107,8 @@ describe('banner from a canonical session snapshot', () => {
 
     const frame = await render(info)
 
-    expect(frame).toMatch(/Available Tools/)
-    expect(frame).toMatch(/Available Skills/)
+    expect(frame).toMatch(/▸ Tools/)
+    expect(frame).toMatch(/▸ Skills/)
     expect(frame).toContain('v0.18.0')
     expect(frame).not.toMatch(/not exposed by this runtime/)
   })

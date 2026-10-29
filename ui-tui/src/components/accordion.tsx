@@ -16,6 +16,7 @@ export function Accordion({
   defaultOpen = false,
   onToggle,
   open,
+  peek,
   suffix,
   t,
   title
@@ -26,6 +27,8 @@ export function Accordion({
   /** Controlled open state; omit for internal (click-toggled) state. */
   open?: boolean
   onToggle?: () => void
+  /** Inline summary shown after the header only while collapsed. */
+  peek?: ReactNode
   suffix?: string
   t: Theme
   title: string
@@ -50,6 +53,7 @@ export function Accordion({
         </Text>
         {typeof count === 'number' ? <Text color={t.color.muted}> ({count})</Text> : null}
         {suffix ? <Text color={t.color.muted}> {suffix}</Text> : null}
+        {!isOpen && peek ? <Text wrap="truncate-end"> {peek}</Text> : null}
       </Box>
 
       {isOpen ? children : null}

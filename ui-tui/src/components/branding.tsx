@@ -96,7 +96,7 @@ function CompactBanner({ cols, t }: { cols: number; t: Theme }) {
   return (
     <Box flexDirection="column" height={3} marginBottom={1} width={w}>
       <Text color={t.color.primary}>{ruleIn(t.brand.name, w)}</Text>
-      <Text color={t.color.muted}>{centerIn(T.tagFull, w)}</Text>
+      <Text color={t.color.muted}>{centerIn(t.brand.tagline || T.tagFull, w)}</Text>
       <Text color={t.color.primary}>{'─'.repeat(w)}</Text>
     </Box>
   )
@@ -133,7 +133,7 @@ export function Banner({ maxWidth, t }: { maxWidth?: number; t: Theme }) {
             {
               children: (
                 <Text color={t.color.muted} wrap="truncate-end">
-                  {t.brand.icon} {T.tagFull}
+                  {t.brand.icon} {t.brand.tagline || T.tagFull}
                 </Text>
               ),
               id: 'banner-tagline'
@@ -159,7 +159,7 @@ export function Banner({ maxWidth, t }: { maxWidth?: number; t: Theme }) {
   }
 
   const name = cols >= 52 ? t.brand.name : (t.brand.name.split(' ')[0] ?? t.brand.name)
-  const tag = cols >= 64 ? T.tagFull : cols >= 46 ? T.tagMid : TAG_TINY
+  const tag = t.brand.tagline || (cols >= 64 ? T.tagFull : cols >= 46 ? T.tagMid : TAG_TINY)
 
   return (
     <Box flexDirection="column" marginBottom={1}>
@@ -230,7 +230,7 @@ export function SessionPanel({ info, maxWidth, sid, t }: SessionPanelProps) {
   const listFade = mix(t.color.muted, t.color.text, 0.5)
 
   // ── Local collapse state for each section ──
-  const [toolsOpen, setToolsOpen] = useState(true)
+  const [toolsOpen, setToolsOpen] = useState(false)
   const [skillsOpen, setSkillsOpen] = useState(false)
   const [systemOpen, setSystemOpen] = useState(false)
   const [mcpOpen, setMcpOpen] = useState(false)
@@ -320,31 +320,52 @@ export function SessionPanel({ info, maxWidth, sid, t }: SessionPanelProps) {
     return n === 1 ? T.toolsOne(n) : T.toolsOther(n)
   }
 
+  const mcpState = (s: (typeof mcpServers)[number]) =>
+    s.connected
+      ? { color: t.color.ok, label: toolCount(s.tools) }
+      : s.disabled || s.status === 'disabled'
+        ? { color: t.color.muted, label: T.disabled }
+        : s.status === 'connecting'
+          ? { color: t.color.warn, label: T.connecting }
+          : s.status === 'lazy'
+            ? // Registered from the schema cache, process not spawned yet: its tools are callable.
+              { color: t.color.ok, label: `${toolCount(s.tools)} ${T.lazy}` }
+            : s.status === 'configured'
+              ? { color: t.color.muted, label: T.configured }
+              : { color: t.color.error, label: T.failed }
+
+  const mcpSorted = [...mcpServers].sort((a, b) => (a.name ?? '').localeCompare(b.name ?? ''))
+  const mcpNameW = Math.min(18, Math.max(0, ...mcpServers.map(s => (s.name ?? '').length)))
+
+  // Collapsed: one row of status dots + names instead of a bare count.
+  const mcpPeek = (
+    <>
+      {mcpSorted
+        .map((s, i) => (
+          <Text key={s.name}>
+            {i > 0 ? '  ' : ''}
+            <Text color={mcpState(s).color}>●</Text>
+            <Text color={listFade}> {s.name}</Text>
+          </Text>
+        ))}
+    </>
+  )
+
   const mcpBody = () => (
     <>
-      {(info.mcp_servers ?? []).map(s => (
-        <Text key={s.name} wrap="truncate">
-          <Text color={t.color.muted}>{`  ${s.name} `}</Text>
-          <Text color={t.color.muted}>{`[${s.transport}]`}</Text>
-          <Text color={t.color.muted}>: </Text>
-          {s.connected ? (
-            <Text color={t.color.text}>{toolCount(s.tools)}</Text>
-          ) : s.disabled || s.status === 'disabled' ? (
-            <Text color={t.color.muted}>{T.disabled}</Text>
-          ) : s.status === 'connecting' ? (
-            <Text color={t.color.warn}>{T.connecting}</Text>
-          ) : s.status === 'lazy' ? (
-            // Registered from the schema cache, process not spawned yet: its tools are callable.
-            <Text color={t.color.text}>
-              {toolCount(s.tools)} <Text color={t.color.muted}>{T.lazy}</Text>
+      {mcpSorted
+        .map(s => {
+          const st = mcpState(s)
+
+          return (
+            <Text key={s.name} wrap="truncate">
+              <Text color={st.color}>{'  ● '}</Text>
+              <Text color={t.color.label}>{clip(s.name ?? '', mcpNameW).padEnd(mcpNameW + 2)}</Text>
+              <Text color={st.color === t.color.ok ? t.color.text : st.color}>{st.label}</Text>
+              <Text color={t.color.muted}>{`  ${s.transport}`}</Text>
             </Text>
-          ) : s.status === 'configured' ? (
-            <Text color={t.color.muted}>{T.configured}</Text>
-          ) : (
-            <Text color={t.color.error}>{T.failed}</Text>
-          )}
-        </Text>
-      ))}
+          )
+        })}
     </>
   )
 
@@ -371,7 +392,7 @@ export function SessionPanel({ info, maxWidth, sid, t }: SessionPanelProps) {
 
       <Text color={t.color.accent}>
         {(info.model ?? '').split('/').pop()}
-        <Text color={t.color.muted}> · Nous Research</Text>
+        {t.brand.vendor ? <Text color={t.color.muted}> · {t.brand.vendor}</Text> : null}
       </Text>
 
       <Text color={t.color.muted} wrap="truncate-end">
@@ -403,7 +424,7 @@ export function SessionPanel({ info, maxWidth, sid, t }: SessionPanelProps) {
         <Box flexDirection="column" marginBottom={1}>
           <Text color={t.color.accent} wrap="truncate-end">
             {(info.model ?? '').split('/').pop()}
-            <Text color={t.color.muted}> · Nous Research</Text>
+            {t.brand.vendor ? <Text color={t.color.muted}> · {t.brand.vendor}</Text> : null}
           </Text>
           <Text color={t.color.muted} wrap="truncate-end">
             {info.cwd || process.cwd()}
@@ -417,15 +438,28 @@ export function SessionPanel({ info, maxWidth, sid, t }: SessionPanelProps) {
         </Box>
       )}
 
-      {/* ── Tools (expanded by default) ── */}
+      {/* ── Tools (collapsed by default) ── */}
       <Box flexDirection="column" marginTop={1}>
-        <Accordion onToggle={() => setToolsOpen(v => !v)} open={toolsOpen} t={t} title={T.availableTools}>
+        <Accordion
+          count={info.lazy && !toolsTotal ? undefined : toolsTotal}
+          onToggle={() => setToolsOpen(v => !v)}
+          open={toolsOpen}
+          suffix={
+            toolEntries.length > 0
+              ? toolEntries.length === 1
+                ? T.inToolsetsOne(toolEntries.length)
+                : T.inToolsetsOther(toolEntries.length)
+              : undefined
+          }
+          t={t}
+          title={T.availableTools}
+        >
           {toolsBody()}
         </Accordion>
       </Box>
 
       {/* ── Skills (collapsed by default) ── */}
-      <Box flexDirection="column" marginTop={1}>
+      <Box flexDirection="column">
         <Accordion
           count={skillsTotal}
           onToggle={() => setSkillsOpen(v => !v)}
@@ -446,7 +480,7 @@ export function SessionPanel({ info, maxWidth, sid, t }: SessionPanelProps) {
 
       {/* ── System Prompt (collapsed by default) ── */}
       {sysPromptLen > 0 && (
-        <Box flexDirection="column" marginTop={1}>
+        <Box flexDirection="column">
           <Accordion
             onToggle={() => setSystemOpen(v => !v)}
             open={systemOpen}
@@ -461,12 +495,12 @@ export function SessionPanel({ info, maxWidth, sid, t }: SessionPanelProps) {
 
       {/* ── MCP Servers (collapsed by default) ── */}
       {mcpServers.length > 0 && (
-        <Box flexDirection="column" marginTop={1}>
+        <Box flexDirection="column">
           <Accordion
-            count={mcpConnected}
             onToggle={() => setMcpOpen(v => !v)}
             open={mcpOpen}
-            suffix={T.connected}
+            peek={mcpPeek}
+            suffix={`${mcpConnected}/${mcpServers.length}`}
             t={t}
             title={T.mcpServers}
           >
@@ -477,15 +511,7 @@ export function SessionPanel({ info, maxWidth, sid, t }: SessionPanelProps) {
 
       <Text />
 
-      <Text color={t.color.text}>
-        {/* Lazy boot: never print "0 tools · 0 skills" while counts load. */}
-        {T.toolsSummary(info.lazy && !toolsTotal ? '…' : toolsTotal)}
-        {' · '}
-        {T.skillsSummary(info.lazy && !skillsTotal ? '…' : skillsTotal)}
-        {mcpConnected ? ` · ${T.mcpSummary(mcpConnected)}` : ''}
-        {' · '}
-        <Text color={t.color.muted}>{T.helpHint}</Text>
-      </Text>
+      <Text color={t.color.muted}>{T.helpHint}</Text>
 
       {typeof info.update_behind === 'number' && info.update_behind > 0 && (
         <Text bold color={t.color.warn}>

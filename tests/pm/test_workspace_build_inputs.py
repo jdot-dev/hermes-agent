@@ -28,7 +28,7 @@ def test_identical_virtual_profiles_share_dependencies_but_keep_independent_inpu
         (plugin / "__init__.py").write_text('# profile-owned runtime\n')
     before = workspace.members_stamp(plugins)
     root = tmp_path / "generated"
-    workspace._generate_pyproject(plugins, root, source=core)
+    workspace._generate_pyproject(plugins, root, source=core, python=Path(sys.executable))
     generated = tomllib.loads((root / "pyproject.toml").read_text())
     assert len(generated["tool"]["uv"]["workspace"]["members"]) == 1
     assert all((plugin / "pyproject.toml").read_text() == metadata for plugin in plugins)

@@ -622,7 +622,12 @@ class MemoryManager:
         return set(self._tool_to_provider)
 
     def has_tool(self, tool_name: str) -> bool:
-        return tool_name in self._tool_to_provider
+        if tool_name not in self._tool_to_provider:
+            return False
+        # Dual-kind plugins also register native handlers paired with their hooks.
+        # Preserve that dispatch path and its host identity; memory-only tools stay inline.
+        from tools.registry import registry
+        return registry.get_entry(tool_name) is None
 
     def handle_tool_call(self, tool_name: str, args: dict[str, Any], **kwargs) -> str:
         """Route a tool call to its provider; returns a JSON string (tool_error on failure)."""

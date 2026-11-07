@@ -1544,6 +1544,12 @@ def _append_batch_results(agent, messages: list, effective_task_id: str, batch: 
                 if isinstance(function_result, _ToolCancelledResult):
                     outcome.update(status="cancelled", error_type="keyboard_interrupt", error_message="Tool execution cancelled by user interrupt")
                 ref.emit_post(agent, function_result, **outcome)
+                if not isinstance(function_result, (_ToolCancelledResult, _ToolTimeoutResult)):
+                    function_result = apply_transform_tool_result(
+                        agent, function_name=ref.name, function_args=ref.args, result=function_result,
+                        effective_task_id=ref.task_id, tool_call_id=ref.call_id,
+                        duration_ms=int(tool_duration * 1000))
+                    is_error, _ = _detect_tool_failure(ref.name, function_result)
         if dispatched and not blocked:
             status = "timeout" if isinstance(function_result, _ToolTimeoutResult) else "cancelled" if isinstance(function_result, _ToolCancelledResult) else "error" if is_error else "ok"
             ref.record_receipt(agent, function_result, tool_duration, status)
@@ -1660,7 +1666,6 @@ class _SequentialDispatch:
     is_delegate: bool = False
     finish_spinner: bool = True
     finish_in_finally: bool = True  # inline tools print their completion line only on success
-    transform_applied: bool = False  # True when execute already fired transform_tool_result
 
 
 def _resolve_sequential_dispatch(agent, ref: _ToolCallRef, messages: list) -> _SequentialDispatch:
@@ -1728,7 +1733,6 @@ def _resolve_sequential_dispatch(agent, ref: _ToolCallRef, messages: list) -> _S
         error_log="handle_function_call raised for %s: %s",
         handles_keyboard_interrupt=True,
         finish_spinner=bool(agent.quiet_mode),
-        transform_applied=True,  # handle_function_call fires transform_tool_result itself
     )
 
 
@@ -1815,23 +1819,19 @@ def _run_sequential_call(
     return managed, tool_duration
 
 
-def _publish_sequential_result(agent, messages: list, ref: _ToolCallRef, managed: _ManagedToolResult, *, tool_duration: float, index: int, budget: BudgetConfig, transform_applied: bool) -> bool:
+def _publish_sequential_result(agent, messages: list, ref: _ToolCallRef, managed: _ManagedToolResult, *, tool_duration: float, index: int, budget: BudgetConfig) -> bool:
     """Terminal hook → observe → commit → completion callbacks/print for one sequential
     result; False when the incremental flush failed (the caller must stop the batch)."""
     ref.args, ref.trace, function_result = managed.args, managed.middleware_trace, managed.result
     _execution_timed_out = isinstance(function_result, (_ToolTimeoutResult, _ToolCancelledResult))
-    # Inline-dispatched runtime tools never reach handle_function_call, so the
-    # executor owns the one terminal post_tool_call per tool_call_id (the inner
-    # observer is suppressed); also stops an abandoned timeout worker reporting late.
-    # transform_tool_result follows the observer, unless the dispatch already fired it.
+    # The terminal owner observes raw results before presentation, including registry tools.
     if not managed.blocked and not _execution_timed_out:
         ref.emit_post(agent, function_result, duration_ms=int(tool_duration * 1000))
-        if not transform_applied:
-            function_result = apply_transform_tool_result(
-                agent, function_name=ref.name, function_args=ref.args, result=function_result,
-                effective_task_id=ref.task_id, tool_call_id=ref.call_id,
-                duration_ms=int(tool_duration * 1000),
-            )
+        function_result = apply_transform_tool_result(
+            agent, function_name=ref.name, function_args=ref.args, result=function_result,
+            effective_task_id=ref.task_id, tool_call_id=ref.call_id,
+            duration_ms=int(tool_duration * 1000),
+        )
     # Classify the result the model will actually see, i.e. after any transform; the
     # registry and concurrent paths both classify post-transform.
     # Multimodal dict results (_multimodal=True) are not sliceable as strings.
@@ -1918,7 +1918,7 @@ def _execute_tool_calls_sequential(agent, assistant_message, messages: list, eff
             tool_start_time=tool_start_time,
         )
         if not _publish_sequential_result(agent, messages, ref, managed, tool_duration=tool_duration, index=i,
-                                          budget=_tool_budget, transform_applied=dispatch.transform_applied):
+                                          budget=_tool_budget):
             return
 
         if agent._interrupt_requested and i < len(tool_calls):

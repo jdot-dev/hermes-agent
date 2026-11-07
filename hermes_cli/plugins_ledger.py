@@ -208,7 +208,7 @@ class PluginLedgerMixin:
                 else:
                     ledger.pop(plugin_key, None)
 
-    # -- dual-kind hook ownership -------------------------------------------------------------
+    # -- dual-kind hook/tool ownership -------------------------------------------------------------
     # A plugin dir loaded by general discovery AND as the configured memory provider calls
     # ``register()`` twice against the same manager. General discovery owns the hook group; the
     # memory loader's hooks are a fallback group keyed by (name, resolved source path) that is
@@ -226,11 +226,25 @@ class PluginLedgerMixin:
         which case return an inert handle so the provider keeps its disposable-handle contract."""
         if hook_source is None:
             return context.register_hook(hook_name, callback, hold_stream=hold_stream)
-        owned = any(loaded.enabled and _hook_source_of(loaded.manifest.name, loaded.module) == hook_source
-                    for loaded in self._plugins.values())
-        handle = (context._track("hook", hook_name, lambda: None) if owned
+        handle = (context._track("hook", hook_name, lambda: None) if self._general_plugin_owns_source(hook_source)
                   else context.register_hook(hook_name, callback, hold_stream=hold_stream))
         self._memory_hook_registrations.setdefault(hook_source, []).append(handle)
+        return handle
+
+    def _general_plugin_owns_source(self, source: tuple) -> bool:
+        return any(loaded.enabled and _hook_source_of(loaded.manifest.name, loaded.module) == source
+                   for loaded in self._plugins.values())
+
+    def _register_fallback_tool(self, context: Any, source: Optional[tuple], name: str,
+                                *args: Any, **kwargs: Any) -> Optional[PluginRegistration]:
+        """Tools and hooks from a dual-kind provider must retain the same registration instance."""
+        if source is None:
+            return context.register_tool(name, *args, **kwargs)
+        handle = (context._track("tool", name, lambda: None) if self._general_plugin_owns_source(source)
+                  else context.register_tool(name, *args, **kwargs))
+        if handle is not None:
+            # This group also owns the tool paired with its hooks, so discovery and reload retire both.
+            self._memory_hook_registrations.setdefault(source, []).append(handle)
         return handle
 
     def _dispose_registrations(self, registrations: list[PluginRegistration]) -> None:

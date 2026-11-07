@@ -34,7 +34,7 @@ _post_tool_call_hook_suppressed: ContextVar[bool] = ContextVar("post_tool_call_h
 
 @contextmanager
 def suppress_post_tool_call_hook(suppressed: bool = True):
-    """Let an outer executor own the terminal post-tool event. ``suppressed=False`` re-enables it
+    """Let an outer executor own the terminal event and subsequent result transform. ``suppressed=False`` re-enables it
     inside such a block, for calls that are their own (each entry of a connector batch)."""
     token = _post_tool_call_hook_suppressed.set(suppressed)
     try:
@@ -951,6 +951,8 @@ def _apply_transform_tool_result_hook(function_name: str, function_args: dict[st
     Runs after post_tool_call and before the result enters context. Fail-open;
     first string return wins. Gated on has_hook so the no-listener path is cheap.
     """
+    if _post_tool_call_hook_suppressed.get():
+        return result
     try:
         from hermes_cli.lifecycle import has_hook, invoke_hook
         if has_hook("transform_tool_result"):

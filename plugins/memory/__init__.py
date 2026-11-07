@@ -442,6 +442,12 @@ class _ProviderCollector:
             return context._manager._register_fallback_hook(
                 context, self._hook_source, hook_name, callback, hold_stream=hold_stream)
 
+    def register_tool(self, name, *args, **kwargs):
+        context = self._plugin_context()
+        with context._manager._discovery_lock:
+            return context._manager._register_fallback_tool(
+                context, self._hook_source, name, *args, **kwargs)
+
     def register_memory_provider(self, provider):
         self.provider = provider
 

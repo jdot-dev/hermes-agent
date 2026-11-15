@@ -120,14 +120,16 @@ def test_s6_manager_kind_and_supports_registration(
     mgr = S6ServiceManager()
     assert mgr.kind == "s6"
     assert mgr.supports_runtime_registration() is True
-    assert mgr.scandir == Path("/run/service")
+    # Upstream c08c485305 moved per-profile gateway slots out of the root s6 scandir
+    # (/run/service) into the hermes-owned nested scandir.
+    assert mgr.scandir == Path("/run/hermes-service")
 
 
 def test_s6_default_scandir_isolated_during_pytest(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A test process must never inherit the live s6 ``/run/service`` tree.
+    """A test process must never inherit a live s6 tree (``/run/service`` or ``/run/hermes-service``).
 
     Regression: running the full suite inside the production container let
     container-aware gateway tests register and restart live services, which
@@ -144,9 +146,10 @@ def test_s6_default_scandir_isolated_during_pytest(
 
     mgr = S6ServiceManager()
 
-    assert _COLLECTION_SCANDIR != Path("/run/service")
+    live_scandirs = {Path("/run/service"), Path("/run/hermes-service")}
+    assert _COLLECTION_SCANDIR not in live_scandirs
     assert mgr.scandir == pytest_scandir
-    assert mgr.scandir != Path("/run/service")
+    assert mgr.scandir not in live_scandirs
 
 # ---------------------------------------------------------------------------
 # _seed_supervise_skeleton — unit tests

@@ -34,6 +34,9 @@ _CACHE_LOCK = threading.Lock()
 # path_key -> (*file_cache_version, parsed)
 _CONFIG_CACHE: dict[str, tuple] = {}
 _ENV_CACHE: dict[str, tuple] = {}
+# Content-signature keyed snapshots for load_managed_config_snapshot(); a different entry shape from
+# the stat-keyed _CONFIG_CACHE above, so it gets its own table.
+_CONFIG_SNAPSHOT_CACHE: dict[str, tuple] = {}
 
 
 def _under_pytest() -> bool:
@@ -63,20 +66,26 @@ def invalidate_managed_cache() -> None:
     """Drop cached managed config/env. For tests and post-edit reloads."""
     with _CACHE_LOCK:
         _CONFIG_CACHE.clear()
+        _CONFIG_SNAPSHOT_CACHE.clear()
         _ENV_CACHE.clear()
 
 
-def _cached_read(path: Path, cache: dict[str, tuple], parse):
+def _cached_read(path: Path, cache: dict[str, tuple], parse, *, strict: bool = False):
     """Shared stat-signature-keyed read; returns a deepcopy of the parsed value.
 
     ``None`` when the file is absent or fails to parse (fail-open). A parse failure is logged
     LOUDLY — the admin needs to know their policy isn't applied — but never raises, so a malformed
-    managed file can't brick startup.
+    managed file can't brick startup. *strict* re-raises read/parse failures (only a missing file is
+    absent) for a security gate that must fail closed instead.
     """
     try:
         st = path.stat()
-    except OSError:
+    except FileNotFoundError:
         return None  # absent
+    except OSError:
+        if strict:
+            raise
+        return None
     key = file_cache_version(path, st)
     path_key = str(path)
     with _CACHE_LOCK:
@@ -86,6 +95,8 @@ def _cached_read(path: Path, cache: dict[str, tuple], parse):
     try:
         parsed = parse(path)
     except Exception as exc:
+        if strict:
+            raise
         logger.warning(
             "managed scope: failed to parse %s: %s — IGNORING this managed file. "
             "Admin policy from this file is NOT being applied. Fix and restart.",
@@ -96,11 +107,11 @@ def _cached_read(path: Path, cache: dict[str, tuple], parse):
     return parsed
 
 
-def _load_managed_file(name: str, cache: dict[str, tuple], parse) -> dict:
+def _load_managed_file(name: str, cache: dict[str, tuple], parse, *, strict: bool = False) -> dict:
     managed_dir = get_managed_dir()
     if managed_dir is None:
         return {}
-    parsed = _cached_read(managed_dir / name, cache, parse)
+    parsed = _cached_read(managed_dir / name, cache, parse, strict=strict)
     return parsed if isinstance(parsed, dict) else {}
 
 
@@ -115,7 +126,7 @@ def load_managed_config_snapshot() -> tuple[dict, tuple | None]:
         return {}, None
     content, signature = snapshot
     with _CACHE_LOCK:
-        hit = _CONFIG_CACHE.get(signature[0])
+        hit = _CONFIG_SNAPSHOT_CACHE.get(signature[0])
         if hit is not None and hit[0] == signature:
             return copy.deepcopy(hit[1]), signature
     try:
@@ -127,17 +138,21 @@ def load_managed_config_snapshot() -> tuple[dict, tuple | None]:
                        "Admin policy from this file is NOT being applied. Fix and restart.", path, exc)
         return {}, signature
     with _CACHE_LOCK:
-        _CONFIG_CACHE[signature[0]] = (signature, copy.deepcopy(parsed))
+        _CONFIG_SNAPSHOT_CACHE[signature[0]] = (signature, copy.deepcopy(parsed))
     return parsed, signature
 
 
-def load_managed_config() -> dict:
+def load_managed_config(*, strict: bool = False) -> dict:
     """Parsed managed config.yaml, or {} when absent/malformed (fail-open). Always {} under a config
-    backend that takes config and locks from elsewhere (remote mode, D18; boot warns about the file)."""
+    backend that takes config and locks from elsewhere (remote mode, D18; boot warns about the file).
+    *strict* raises on an unreadable or malformed file instead of returning {}."""
     from hermes_cli.config_backend import get_config_backend
 
     if not get_config_backend().honors_managed_config():
         return {}
+    if strict:
+        return _load_managed_file("config.yaml", _CONFIG_CACHE, lambda p: fast_safe_load(p.read_text(encoding="utf-8-sig")) or {},
+                                  strict=strict)
     return load_managed_config_snapshot()[0]
 
 

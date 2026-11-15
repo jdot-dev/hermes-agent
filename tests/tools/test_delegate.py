@@ -1160,11 +1160,10 @@ class TestChildCredentialPoolResolution(unittest.TestCase):
         parent.provider, parent.base_url, parent.requested_provider = "custom", url, "custom:open-ai"
         parent._credential_pool = None
 
-        with patch("tools.delegate_tool_config._loaded_pool", side_effect=lambda key: key) as loaded:
-            key = _resolve_child_credential_pool("custom", parent, url, effective_requested_provider="custom:open-ai")
-        loaded.assert_called_once()
-        self.assertIn("open-ai", key)
-        self.assertNotIn("claude", key)
+        with patch("tools.delegate_tool_config._loaded_pool", return_value=None) as loaded:
+            _resolve_child_credential_pool("custom", parent, url, effective_requested_provider="custom:open-ai")
+        (key,) = loaded.assert_called_once() or loaded.call_args.args
+        self.assertTrue("open-ai" in key and "claude" not in key)
 
 
     @patch(
@@ -2452,7 +2451,9 @@ class TestDelegationRoutes(unittest.TestCase):
         self.assertEqual(MockAgent.call_args.kwargs["model"], "legacy-model")
         self.assertEqual(MockAgent.call_args.kwargs["provider"], "legacy-provider")
         self.assertEqual(mock_creds.call_count, 1)
-        self.assertIs(mock_creds.call_args.args[0], cfg)
+        # The default delegation backend hands the resolver a cleaned copy of the section (dict(config) filtered to
+        # route keys), not the object itself: the legacy top-level fields must arrive unchanged and no route applied.
+        self.assertEqual(mock_creds.call_args.args[0], cfg)
 
     def test_resolve_delegation_route_config_overlays_route_fields(self):
         cfg = {

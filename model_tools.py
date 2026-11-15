@@ -247,13 +247,35 @@ def _tool_defs_config_fingerprints() -> tuple[Any, Any]:
     return cfg_fp, managed_fp
 
 
+def _hosted_scope_active() -> bool:
+    from tools.environments.sandbox_scope import hosted_scope
+    return hosted_scope() is not None
+
+
+_UNSET_KEY_ARG: Any = object()
+
+
 def _tool_defs_cache_key(
     enabled_toolsets: Optional[list[str]],
     disabled_toolsets: Optional[list[str]],
     skip_tool_search_assembly: bool,
-    profile_scope: Any,
-    config_fingerprints: tuple[Any, Any],
-) -> tuple:
+    profile_scope: Any = _UNSET_KEY_ARG,
+    config_fingerprints: Any = _UNSET_KEY_ARG,
+) -> Optional[tuple]:
+    """Memo key for get_tool_definitions, or None when caching must be bypassed.
+
+    ``get_tool_definitions`` passes the profile scope and the config content
+    fingerprints it already took (so its before/after retry compares the same
+    snapshot). Called with only the three toolset arguments (upstream's
+    signature) both are computed here, and a bypassed check_fn scope yields
+    None.
+    """
+    if profile_scope is _UNSET_KEY_ARG:
+        profile_scope = check_fn_cache_scope()
+        if profile_scope == CHECK_FN_CACHE_BYPASS:
+            return None
+    if config_fingerprints is _UNSET_KEY_ARG:
+        config_fingerprints = _tool_defs_config_fingerprints()
     cfg_fp, managed_fp = config_fingerprints
     return (
         registry.current_scope_key(),
@@ -268,6 +290,7 @@ def _tool_defs_cache_key(
         _is_dispatcher_owned_worker(),
         profile_scope,
         check_fn_cache_epoch(),
+        _hosted_scope_active(),
     )
 
 
@@ -313,9 +336,13 @@ def get_tool_definitions(
     from hermes_cli.config import _CONFIG_LOCK
 
     for attempt in range(2):
-        # Serialize fingerprinting and dynamic config parsing with config
-        # writers. Atomic external replacements can still occur, so retain
-        # the post-compute identity check and retry below.
+        # Serialize fingerprinting with in-process config writers. Schema
+        # computation itself runs outside ``_CONFIG_LOCK``: registry check_fns
+        # are probed on worker threads (tools.registry._call_check_fn) and many
+        # of them read config under that same lock, so holding it here would
+        # park every probe until its timeout. Writers that land during the
+        # compute (in-process or atomic external replacements) are caught by
+        # the post-compute fingerprint comparison and retried below.
         with _CONFIG_LOCK:
             before = _tool_defs_config_fingerprints()
             cache_key = (
@@ -329,38 +356,39 @@ def get_tool_definitions(
                 if cache_enabled
                 else None
             )
-            with _tool_defs_cache_lock:
-                cached = _live_tool_defs_entry(cache_key) if cache_key is not None else None
-            if cached is not None:
-                if _tool_defs_config_fingerprints() == before:
-                    global _last_resolved_tool_names
-                    _last_resolved_tool_names = [
-                        t["function"]["name"] for t in cached
-                    ]
-                    return list(cached)
-                if attempt == 0:
-                    continue
-                # A continuously changing config cannot safely populate a cache.
-                # The cached entry still matches the latest complete `before`
-                # snapshot, so prefer it to crashing or returning a torn schema.
+        with _tool_defs_cache_lock:
+            cached = _live_tool_defs_entry(cache_key) if cache_key is not None else None
+        if cached is not None:
+            if _tool_defs_config_fingerprints() == before:
+                global _last_resolved_tool_names
                 _last_resolved_tool_names = [
                     t["function"]["name"] for t in cached
                 ]
                 return list(cached)
+            if attempt == 0:
+                continue
+            # A continuously changing config cannot safely populate a cache.
+            # The cached entry still matches the latest complete `before`
+            # snapshot, so prefer it to crashing or returning a torn schema.
+            _last_resolved_tool_names = [
+                t["function"]["name"] for t in cached
+            ]
+            return list(cached)
 
-            with check_fn_verdict_window() as verdict_expiry:
-                result = _compute_tool_definitions(
-                    enabled_toolsets,
-                    disabled_toolsets,
-                    quiet_mode,
-                    skip_tool_search_assembly=skip_tool_search_assembly,
-                )
+        with check_fn_verdict_window() as verdict_expiry:
+            result = _compute_tool_definitions(
+                enabled_toolsets,
+                disabled_toolsets,
+                quiet_mode,
+                skip_tool_search_assembly=skip_tool_search_assembly,
+            )
+        with _CONFIG_LOCK:
             after = _tool_defs_config_fingerprints()
-            if before != after:
-                if attempt == 0:
-                    continue
-                # A continuously changing config cannot safely populate a cache.
-                return list(result)
+        if before != after:
+            if attempt == 0:
+                continue
+            # A continuously changing config cannot safely populate a cache.
+            return list(result)
         if cache_key is None:
             return list(result)
 
@@ -529,9 +557,14 @@ _VAULT_INPUT_TOOL_HINT = "the browser's input tool"
 def _rewrite_browser_vault(td: dict[str, Any], available: set) -> Optional[dict[str, Any]]:
     """Name the concrete input tool for typing the login identifier (`fill_input` inside browser_exec code).
     Resolved here because the two live in different toolsets."""
-    if "browser_exec" not in available:
+    preview = "drive_preview" in available
+    if "browser_exec" in available:
+        concrete = "`fill_input` inside browser_exec" + (
+            " (or drive_preview action=type on the in-app browser)" if preview else "")
+    elif preview:
+        concrete = "drive_preview action=type"
+    else:
         return td
-    concrete = "`fill_input` inside browser_exec"
     fn = td["function"]
     return _fn_def({**fn, "description": fn.get("description", "").replace(_VAULT_INPUT_TOOL_HINT, concrete)})
 
@@ -548,7 +581,10 @@ def _rewrite_input_tool_for_vault(td: dict[str, Any], available: set) -> Optiona
     if "browser_vault" not in available:
         return td
     fn = td["function"]
-    return _fn_def({**fn, "description": fn.get("description", "") + _VAULT_NO_PASSWORD_NOTE})
+    note = _VAULT_NO_PASSWORD_NOTE
+    if fn["name"] == "drive_preview":
+        note += " For this in-app page pass target=preview (the default when no managed browser page is open)."
+    return _fn_def({**fn, "description": fn.get("description", "") + note})
 
 
 def _compose_rewriters(*fns):
@@ -568,6 +604,7 @@ _DYNAMIC_SCHEMA_REWRITERS = {
     "browser_cdp": _rewrite_browser_cdp,
     "browser_exec": _compose_rewriters(_rewrite_browser_exec, _rewrite_browser_exec_vision, _rewrite_input_tool_for_vault),
     "browser_vault": _rewrite_browser_vault,
+    "drive_preview": _rewrite_input_tool_for_vault,
     "delegate_task": _rewrite_delegate_task,
 }
 
@@ -636,7 +673,10 @@ def _compute_tool_definitions(enabled_toolsets: Optional[list[str]] = None, disa
     except Exception as e:  # pragma: no cover — never break tool loading
         logger.warning("Tool search assembly skipped: %s", e)
 
-    return filtered_tools
+    from tools.hosted_tool_policy import hosted_tool_refusal
+    # A hosted scope runs only its allowlist (the tool_search bridge included): advertising the
+    # rest would only earn refusals.
+    return [tool for tool in filtered_tools if hosted_tool_refusal(tool["function"]["name"]) is None]
 
 
 def _active_model_config() -> tuple[str, dict[str, Any]]:
@@ -745,6 +785,7 @@ class _CallIds:
     tool_call_id: Optional[str] = None
     turn_id: Optional[str] = None
     api_request_id: Optional[str] = None
+    conversation_id: Optional[str] = None  # compression-stable root (agent.prompt_cache_scope.conversation_id)
 
     def hook_kwargs(self) -> dict[str, str]:
         """Same fields with None -> "" (hook/middleware wire contract)."""
@@ -774,7 +815,7 @@ def _emit_post_tool_call_hook(
     task_id: Optional[str] = None, session_id: Optional[str] = None, tool_call_id: Optional[str] = None,
     turn_id: Optional[str] = None, api_request_id: Optional[str] = None, duration_ms: int = 0,
     status: Optional[str] = None, error_type: Optional[str] = None, error_message: Optional[str] = None,
-    middleware_trace: Optional[list[dict[str, Any]]] = None,
+    middleware_trace: Optional[list[dict[str, Any]]] = None, conversation_id: Optional[str] = None,
 ) -> None:
     """Emit the ``post_tool_call`` observer hook; gated on has_hook, and ok/error
     fields are derived from the result only past that gate when status is None."""
@@ -788,7 +829,7 @@ def _emit_post_tool_call_hook(
             status, error_type, error_message = _tool_result_observer_fields(function_name, result)
         invoke_hook(
             "post_tool_call", tool_name=function_name, args=function_args, result=result,
-            **_CallIds(task_id, session_id, tool_call_id, turn_id, api_request_id).hook_kwargs(),
+            **_CallIds(task_id, session_id, tool_call_id, turn_id, api_request_id, conversation_id).hook_kwargs(),
             duration_ms=duration_ms, status=status, error_type=error_type, error_message=error_message,
             middleware_trace=list(middleware_trace or []),
         )
@@ -922,13 +963,20 @@ def _execute_tool(function_name: str, function_args: dict[str, Any], original_ar
                   *, user_task: Optional[str], enabled_tools: Optional[list[str]], skip_tool_execution_middleware: bool) -> Any:
     """Run the registry handler (through tool-execution middleware unless skipped)
     with the approval observability context bound for the duration."""
-    dispatch_kwargs: dict[str, Any] = {"task_id": ids.task_id, "session_id": ids.session_id}
+    dispatch_kwargs: dict[str, Any] = {
+        "task_id": ids.task_id, "session_id": ids.session_id, "conversation_id": ids.conversation_id}
     if function_name == "execute_code":
+        dispatch_kwargs["turn_id"] = ids.turn_id
         # Prefer the caller's list so subagents can't overwrite the parent's
         # tool set via the process-global.
         dispatch_kwargs["enabled_tools"] = enabled_tools if enabled_tools is not None else _last_resolved_tool_names
     else:
         dispatch_kwargs["user_task"] = user_task
+    from agent.plugin_session_fork import current_turn_origin
+    if (turn_origin := current_turn_origin()) is not None:
+        # Only inside a plugin session fork ("plugin_fork:<plugin id>"), so a plugin's tool can
+        # refuse calls the live agent makes; live-turn handlers see no new kwarg.
+        dispatch_kwargs["turn_origin"] = turn_origin
 
     def _dispatch(next_args: dict[str, Any]) -> Any:
         from tools.connectors import dispatch_connector_call, is_connector_name
@@ -977,6 +1025,7 @@ def handle_function_call(
     skip_pre_tool_call_hook: bool = False, skip_tool_request_middleware: bool = False,
     skip_tool_execution_middleware: bool = False, tool_request_middleware_trace: Optional[list[dict[str, Any]]] = None,
     enabled_toolsets: Optional[list[str]] = None, disabled_toolsets: Optional[list[str]] = None,
+    conversation_id: Optional[str] = None,
 ) -> str:
     """Route a tool call through hooks/middleware to the registry; returns a JSON string.
 
@@ -991,8 +1040,13 @@ def handle_function_call(
         function_args = {}
     trace = list(tool_request_middleware_trace or [])
     function_name = _LEGACY_TOOL_ALIASES.get(function_name, function_name)
-    ids = _CallIds(task_id, session_id, tool_call_id, turn_id, api_request_id)
+    ids = _CallIds(task_id, session_id, tool_call_id, turn_id, api_request_id, conversation_id)
     start = time.monotonic()
+    from tools.hosted_tool_policy import hosted_tool_refusal
+    if refusal := hosted_tool_refusal(function_name):
+        # Callers outside the agent loop (execute_code RPC, the session kernel, the MCP bridge,
+        # connector batches) meet the same allowlist before bridges, connectors or the registry.
+        return tool_error(refusal)
 
     def _emit(result: Any, **extra: Any) -> Any:
         """Emit post_tool_call with this call's identity fields; returns *result*."""
@@ -1015,10 +1069,14 @@ def handle_function_call(
                 enabled_tools=enabled_tools, middleware_trace=trace,
                 enabled_toolsets=enabled_toolsets, disabled_toolsets=disabled_toolsets,
             ), duration_ms=_elapsed_ms(start))
+        # The caller's skip_* flags describe the WRAPPER call it already policed, never the
+        # underlying tool: forwarding them left the real tool with no pre_tool_call hook,
+        # no request middleware and no execution middleware at all. Same rule as the
+        # connector batch re-dispatch (tools/connectors/dispatch.py).
         return handle_function_call(
             *underlying, **asdict(ids), user_task=user_task, enabled_tools=enabled_tools,
-            skip_pre_tool_call_hook=skip_pre_tool_call_hook, skip_tool_request_middleware=skip_tool_request_middleware,
-            skip_tool_execution_middleware=skip_tool_execution_middleware, tool_request_middleware_trace=list(trace),
+            skip_pre_tool_call_hook=False, skip_tool_request_middleware=False,
+            skip_tool_execution_middleware=False, tool_request_middleware_trace=list(trace),
             enabled_toolsets=enabled_toolsets, disabled_toolsets=disabled_toolsets,
         )
 
